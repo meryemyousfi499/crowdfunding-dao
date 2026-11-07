@@ -1,0 +1,44 @@
+{
+  "name": "crowdfund-dao",
+  "version": "1.0.0",
+  "description": "Plateforme de crowdfunding décentralisée à gouvernance par jeton (CFD)",
+  "directories": {
+    "doc": "docs",
+    "test": "test"
+  },
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:offline": "USE_SOLCJS=1 hardhat test",
+    "node": "hardhat node",
+    "deploy:local": "hardhat run scripts/deploy.js --network localhost",
+    "seed": "hardhat run scripts/seed.js --network localhost",
+    "advance": "hardhat run scripts/advance-time.js --network localhost",
+    "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia",
+    "web": "python scripts/serve.py",
+    "analyze": "python3 analysis/fraud_detector.py",
+    "coverage": "hardhat coverage",
+    "slither": "slither . --exclude-dependencies --filter-paths node_modules",
+    "keeper": "hardhat run scripts/keeper.js --network localhost",
+    "test:fuzz": "hardhat test test/Fuzz.test.js",
+    "fund": "hardhat run scripts/fund.js --network localhost",
+    "start:local": "node scripts/dev.js",
+    "backend": "npm run deploy:local && npm run keeper",
+    "backend:seed": "npm run deploy:local && npm run seed && npm run keeper",
+    "keeper:sepolia": "hardhat run scripts/keeper.js --network sepolia"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "dotenv": "^16.6.1",
+    "fast-check": "^3.23.2",
+    "hardhat": "^2.29.1",
+    "solc": "^0.8.24"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.6.1"
+  },
+  "private": true
+}

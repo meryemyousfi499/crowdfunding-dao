@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CrowdFund DAO – Financement participatif décentralisé</title>
+<link rel="stylesheet" href="styles.css">
+<script src="vendor/ethers.umd.min.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="wrap bar">
+    <a class="brand" href="#/"><span class="logo">◈</span> CrowdFund<b>DAO</b></a>
+    <nav id="nav">
+      <a href="#/" data-r="home">Campagnes</a>
+      <a href="#/mine" data-r="mine">Mes projets</a>
+      <a href="#/contribs" data-r="contribs">Mes contributions</a>
+      <a href="#/dao" data-r="dao">Gouvernance</a>
+      <a href="#/account" data-r="account">Mon compte</a>
+    </nav>
+    <div class="right">
+      <span id="net" class="pill hidden"></span>
+      <button id="settings" class="ghost" title="Paramètres IPFS">⚙</button>
+      <button id="connect" class="primary">Connecter MetaMask</button>
+    </div>
+  </div>
+</header>
+<main id="app" class="wrap"><p class="muted">Chargement…</p></main>
+<footer class="wrap foot">
+  <p>Projet pédagogique – contrats non audités. N'utilisez que des réseaux de test (localhost / Sepolia) et des fonds sans valeur.</p>
+</footer>
+<div id="toasts"></div>
+<dialog id="dlg"><form method="dialog" id="dlgForm"></form></dialog>
+<script src="app.js"></script>
+</body>
+</html>
