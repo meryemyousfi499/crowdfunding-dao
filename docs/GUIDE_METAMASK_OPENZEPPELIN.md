@@ -30,7 +30,6 @@ Installation : `npm install @openzeppelin/contracts` (déjà fait). Contrats uti
 | `AccessControl` | rôles `MINTER_ROLE`, `PAUSER_ROLE`, `GOVERNANCE_ROLE`, admin |
 | `ReentrancyGuard` | `nonReentrant` sur contribute / refund / withdrawFunds / claimTokens / sweepFees / execute |
 | `Pausable` | circuit breaker |
-| `Math.sqrt` | poids de vote quadratique |
 
 Pour partir de **OpenZeppelin Wizard** (https://wizard.openzeppelin.com) : choisir *ERC20* → cocher *Mintable, Votes, Permit, Access Control (Roles)* → copier le code, comparer avec `contracts/CFDToken.sol`. Le Wizard n'est qu'un point de départ : la logique de verrouillage et de mint par le Core est propre à ce projet.
 

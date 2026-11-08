@@ -61,8 +61,40 @@ describe("Fuzzing par propriétés (fast-check)", function () {
         }
         return true;
       }),
-      { numRuns: 40, endOnFailure: false }
+      { numRuns: Number(process.env.FUZZ_RUNS || 100), endOnFailure: false }
     );
     console.log(`      ${runs} séquences aléatoires jouées (avec réduction automatique en cas d'échec)`);
+  });
+  it("invariant de gouvernance : somme des poids de vote <= offre de CFD au snapshot (et = soldes des votants)", async () => {
+    const { core, dao, token, creator, beneficiary, alice, bob, carol, dave } = await deployAll();
+    const users = [alice, bob, carol, dave];
+    await createCampaign(core, creator, beneficiary, { goal: "100000", duration: 30 * DAY, milestones: 2 });
+    const snap = await takeSnapshot();
+    let runs = 0;
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(fc.integer({ min: 0, max: 3000 }), { minLength: 4, maxLength: 4 }), // contributions en milli-ETH (0 = aucune)
+        fc.array(fc.boolean(), { minLength: 4, maxLength: 4 }),                       // vote pour / contre
+        async (milli, sides) => {
+          await snap.restore(); runs++;
+          milli[0] = Math.max(milli[0], 20); // alice détient au moins 20 CFD : elle peut proposer (seuil 10 CFD)
+          for (let i = 0; i < 4; i++) if (milli[i] >= 1) await core.connect(users[i]).contribute(0, { value: ethers.parseEther("0.001") * BigInt(milli[i]) });
+          await dao.connect(alice).propose(0, 0, "fuzz");
+          let expected = 0n;
+          for (let i = 0; i < 4; i++) {
+            const ok = await dao.connect(users[i]).castVote(0, sides[i]).then(() => true, () => false);
+            if (ok) expected += ethers.parseEther("0.001") * BigInt(milli[i]) * 1000n;
+          }
+          const p = await dao.getProposal(0);
+          const supply = await token.getPastTotalSupply(p.snapshotBlock);
+          const total = p.forVotes + p.againstVotes;
+          expect(total).to.be.lte(supply);   // jamais plus de voix que de jetons
+          expect(total).to.equal(expected);  // exactement la somme des soldes des votants (aucun arrondi)
+          return true;
+        }
+      ),
+      { numRuns: Number(process.env.FUZZ_RUNS || 100), endOnFailure: false }
+    );
+    console.log(`      ${runs} scénarios de vote aléatoires`);
   });
 });

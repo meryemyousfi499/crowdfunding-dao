@@ -4,10 +4,11 @@ Mini-projet Blockchain (ENSA Béni Mellal, IA & Cybersécurité). Solidity 0.8.2
 
 ```
 contracts/   CFDToken (M1) · CrowdfundingCore (M2) · CrowdfundDAO (M3) · MultiSigTreasury · mocks/ReentrancyAttacker
-test/        33 tests : unitaires, réentrance, snapshot, quadratique, timelock, gel, multisig (seuil), keeper, fuzzing (fast-check)
+test/        55 tests : unitaires, réentrance, snapshot, vote linéaire anti-Sybil, quorum « pour », veto du multisig, timelock, gel, multisig (seuil), keeper, fuzzing (fast-check)
 scripts/     deploy.js · seed.js (données de démo) · advance-time.js
-frontend/    dApp M4 (HTML/JS + Ethers.js, sans build) · metadata/ (métadonnées de démo)
-analysis/    fraud_detector.py (bonus IA hors-chaîne : web3.py + Pandas)
+frontend/    dApp M4 (HTML/JS + Ethers.js, sans build; notifications.js = cloche 🔔 de notifications) · metadata/ (métadonnées de démo)
+scripts/     backend.js (deploy + keeper + surveillance IA) · demo-fraud.js (attaque de test en direct)
+analysis/    fraud_detector.py + ml_model.py (bonus IA hors-chaîne : web3.py + Pandas + Random Forest scikit-learn)
 docs/        ARCHITECTURE.md · SECURITE.md · AUDIT.md · GUIDE_METAMASK_OPENZEPPELIN.md · slither-report.json
 ```
 
@@ -72,8 +73,8 @@ Résultats et corrections : **docs/AUDIT.md**.
 | Taux CFD | 1 ETH = 1000 CFD, frappés à la contribution, **verrouillés** jusqu'à la livraison complète ; brûlés au remboursement |
 | Statuts | Active → Réussie / Échouée (à l'échéance) ; Annulée (campagne vide annulée ou gel DAO) |
 | Retrait | Par tranches (1–5), chacune validée par un vote DAO ; 2 % de frais → trésorerie multisig 2/3 |
-| Vote | Poids = √(CFD au snapshot) · quorum = nb. minimal de votants · majorité simple · timelock avant exécution |
-| Pause | `PAUSER_ROLE` suspend contributions, remboursements, retraits, jetons |
+| Vote | Poids = CFD au snapshot (vote linéaire, 1 CFD = 1 voix) · quorum = 10 % de l’offre en votes « pour » (+ plancher) · majorité simple · timelock 48 h · veto du multisig |
+| Pause | `PAUSER_ROLE` (multisig) suspend contributions, remboursements, retraits ; **limitée à 7 jours** : ensuite n'importe qui appelle `unpauseExpired()` |
 
 ⚠ Projet pédagogique, contrats **non audités par un tiers** : ne jamais utiliser de fonds réels.
 
@@ -82,3 +83,24 @@ Résultats et corrections : **docs/AUDIT.md**.
 - **Trésorerie multisig** : dApp → Gouvernance → « Ouvrir la trésorerie multisig » (`#/treasury`). En local, propriétaires = comptes #17, #18, #19 de `hardhat node` (à importer dans MetaMask).
 - **IPFS** : ⚙ Paramètres IPFS → coller le JWT Pinata → « Tester la connexion ». Option « Avancé » du formulaire de création : coller un CID déjà épinglé.
 - **Fuzzing** : `npm run test:fuzz`.
+- **Mode test sans MetaMask (local uniquement)** : ouvrir `http://127.0.0.1:3000/frontend/?dev=1`. Un sélecteur en haut propose les 20 comptes Hardhat (#0…#19) ; les transactions partent sans pop-up ni problème de nonce. Utile pour dérouler tout le plan de test ; MetaMask n'est alors nécessaire que pour Sepolia.
+- **Utiliser vos propres comptes MetaMask en local (sans importer de clé)** : `$env:ADDRS="0xVotreAdresse1,0xVotreAdresse2"; npm run fund` donne 100 ETH de test à ces adresses sur le nœud local. Pour que ce soient eux les propriétaires du multisig : `$env:MULTISIG_OWNERS="0xA,0xB,0xC"` avant `npm run deploy:local`.
+- **Temps automatique en local** : `npx hardhat node` produit désormais un bloc par seconde, donc le temps de la chaîne suit l'horloge réelle. Fin de vote, timelock et keeper (`npm run keeper`) fonctionnent seuls ; `npm run advance` ne sert plus qu'à « sauter » de longues durées (campagne de 1 jour, etc.). Redémarrer le nœud après mise à jour de `hardhat.config.js`.
+- **Tout en une commande (local)** : `npm run start:local` lance le nœud, déploie les contrats, démarre le keeper et le site (`$env:SEED=1` pour ajouter les campagnes de démo). Ouvrir ensuite http://127.0.0.1:3000/frontend/ ; Ctrl+C arrête tout.
+- **Automatisation complète (keeper)** : `npm run keeper` (ou `npm run start:local`) fait tout seul : mise en file / exécution des propositions, versement des tranches validées, déblocage des CFD après livraison, remboursement des campagnes échouées ou gelées, transfert des frais vers la trésorerie. Les fonctions `payout`, `claimTokensFor`, `refundFor`, `sweepFees` sont publiques mais l'argent va TOUJOURS à son propriétaire (bénéficiaire, contributeur, trésorerie), jamais à l'appelant.  La dApp ne propose donc aucun bouton manuel pour ces étapes et se rafraîchit seule toutes les 4 s.
+
+## Lancer en local : 3 terminals (recommandé)
+| Terminal | Commande | Rôle |
+|---|---|---|
+| 1 | `npm run node` | Nœud Hardhat (affiche les 20 comptes et leurs clés), 1 bloc par seconde |
+| 2 | `npm run backend` | Déploie les contrats puis lance le robot d'automatisation (keeper). `npm run backend:seed` ajoute les campagnes de démo |
+| 3 | `npm run web` | Site : http://127.0.0.1:3000/frontend/ |
+
+Toujours démarrer le terminal 1 en premier. Si vous redémarrez le terminal 1, relancez le terminal 2 (la chaîne est réinitialisée). `npm run start:local` fait les trois d'un coup.
+
+## Sepolia : mêmes 3 rôles, sans nœud local
+| Étape | Commande | Quand |
+|---|---|---|
+| Déployer | `npm run deploy:sepolia` | **Une seule fois** (ne pas redéployer à chaque session : les campagnes sont conservées sur la chaîne) |
+| Robot | `npm run keeper:sepolia` | À laisser tourner pendant la démo (il paie le gas avec le compte du `.env`) |
+| Site | `npm run web` | Comme en local ; MetaMask sur Sepolia |

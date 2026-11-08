@@ -114,11 +114,23 @@ contract CrowdfundingCore is ICrowdfundingCore, AccessControl, ReentrancyGuard, 
     //  Administration (circuit breaker)
     // =====================================================================
 
+    /// @notice Durée maximale d'une pause : au-delà, N'IMPORTE QUI peut la lever (anti-censure).
+    uint256 public constant MAX_PAUSE = 7 days;
+    uint256 public pausedAt;
+
     function pause() external onlyRole(PAUSER_ROLE) {
+        pausedAt = block.timestamp;
         _pause();
     }
 
     function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /// @notice Lève une pause qui dure depuis plus de MAX_PAUSE : si les administrateurs disparaissent ou abusent,
+    ///         les contributeurs retrouvent l'accès à leurs remboursements.
+    function unpauseExpired() external {
+        require(paused() && block.timestamp >= pausedAt + MAX_PAUSE, "pause active");
         _unpause();
     }
 

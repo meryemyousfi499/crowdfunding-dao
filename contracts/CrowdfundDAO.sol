@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {CFDToken} from "./CFDToken.sol";
 import {ICrowdfundingCore} from "./interfaces/ICrowdfundingCore.sol";
@@ -16,13 +15,20 @@ import {ICrowdfundingCore} from "./interfaces/ICrowdfundingCore.sol";
  *     token.getPastVotes. Acheter / emprunter des CFD (flash loan) APRÈS la création d'une
  *     proposition ne donne aucun poids. Les CFD sont de plus verrouillés (non transférables)
  *     tant qu'une campagne n'est pas livrée.
- *  2. VOTE QUADRATIQUE : le poids = racine carrée du solde (en CFD entiers) au snapshot.
- *     Obtenir 2x plus de voix coûte 4x plus de jetons : on réduit l'influence des baleines.
- *     Limite connue : le vote quadratique est sensible aux attaques Sybil (diviser ses fonds
- *     sur plusieurs adresses) ; contrepartie : contribution minimale, jetons verrouillés,
- *     quorum en NOMBRE de votants et détection hors-chaîne (script Python).
+ *  2. VOTE LINÉAIRE : poids = solde exact de CFD (18 décimales, sans arrondi) au snapshot. Les CFD sont verrouillés et
+ *     proportionnels aux ETH engagés : fractionner ses fonds sur 50 adresses donne EXACTEMENT le même
+ *     pouvoir total que sur une seule (aucun avantage Sybil). L'attaquant doit immobiliser du capital réel.
+ *  2bis. QUORUM SUR LES VOTES « POUR » : les votes pour doivent représenter au moins `quorumBps`
+ *     (ex. 10 %) de l'offre totale de CFD au snapshot ET au moins `minQuorum` CFD en valeur absolue
+ *     (plancher : quand l'offre est encore petite, 10 % ne coûterait presque rien à un attaquant). Un attaquant minoritaire seul ne peut pas
+ *     faire passer une proposition : il doit convaincre de vrais contributeurs.
+ *  2ter. MATURITÉ DU SNAPSHOT : le snapshot est pris `snapshotLookback` blocs AVANT la création de la
+ *     proposition. Il faut donc détenir ses CFD depuis un certain temps pour proposer ou voter
+ *     (acheter puis proposer aussitôt ne donne aucun poids).
  *  3. TIMELOCK : une proposition adoptée doit être « queued » puis attend `timelockDelay`
  *     avant exécution (fenêtre pour réagir / alerter) ; elle expire après `GRACE_PERIOD`.
+ *  3bis. VETO DU MULTISIG (`guardian`) : pendant le timelock, le multisig 2-sur-3 peut ANNULER une
+ *     proposition adoptée mais malveillante. Il ne peut qu'annuler : jamais approuver ni exécuter.
  *  4. SEUIL DE PROPOSITION : il faut détenir `proposalThreshold` CFD au snapshot pour proposer.
  *  5. EFFETS AVANT INTERACTIONS : l'état est mis à jour avant l'appel au Core.
  */
@@ -39,7 +45,8 @@ contract CrowdfundDAO is ReentrancyGuard {
         Succeeded,
         Queued,
         Executed,
-        Expired
+        Expired,
+        Canceled // annulée par le veto du multisig pendant le timelock
     }
 
     struct Proposal {
@@ -52,20 +59,25 @@ contract CrowdfundDAO is ReentrancyGuard {
         uint64 eta; // date d'exécution possible (timelock) ; 0 si non mis en file
         bool queued;
         bool executed;
-        uint256 forVotes; // poids quadratique
+        bool canceled;
+        uint256 forVotes; // poids linéaire (solde de CFD, 18 décimales)
         uint256 againstVotes;
         uint256 voters; // nombre de votants distincts
         string description;
     }
 
     uint256 public constant GRACE_PERIOD = 7 days;
+    uint256 public constant BPS = 10_000;
 
     CFDToken public immutable token;
     ICrowdfundingCore public immutable core;
     uint256 public immutable votingPeriod;
     uint256 public immutable timelockDelay;
     uint256 public immutable proposalThreshold; // en CFD (18 décimales)
-    uint256 public immutable quorumVoters; // nombre minimal de votants distincts
+    uint256 public immutable quorumBps; // quorum sur les votes POUR, en points de base de l'offre au snapshot (1000 = 10 %)
+    uint256 public immutable minQuorum; // plancher absolu du quorum, en CFD (18 décimales)
+    uint256 public immutable snapshotLookback; // nombre de blocs entre le snapshot et la création de la proposition (>= 1)
+    address public immutable guardian; // multisig autorisé à opposer son veto pendant le timelock
 
     Proposal[] private _proposals;
     mapping(uint256 => mapping(address => bool)) public hasVoted;
@@ -83,6 +95,7 @@ contract CrowdfundDAO is ReentrancyGuard {
     error WrongState(ProposalState current);
     error TimelockNotElapsed(uint64 eta);
     error InvalidAction();
+    error NotGuardian();
 
     event ProposalCreated(
         uint256 indexed id,
@@ -96,6 +109,7 @@ contract CrowdfundDAO is ReentrancyGuard {
     event VoteCast(uint256 indexed id, address indexed voter, bool support, uint256 weight, uint256 rawBalance);
     event ProposalQueued(uint256 indexed id, uint64 eta);
     event ProposalExecuted(uint256 indexed id);
+    event ProposalCanceled(uint256 indexed id, address indexed guardian, string reason);
 
     constructor(
         CFDToken token_,
@@ -103,16 +117,23 @@ contract CrowdfundDAO is ReentrancyGuard {
         uint256 votingPeriod_,
         uint256 timelockDelay_,
         uint256 proposalThreshold_,
-        uint256 quorumVoters_
+        uint256 quorumBps_,
+        uint256 minQuorum_,
+        uint256 snapshotLookback_,
+        address guardian_
     ) {
         require(address(token_) != address(0) && address(core_) != address(0), "zero address");
-        require(votingPeriod_ > 0 && quorumVoters_ > 0, "bad params");
+        require(guardian_ != address(0), "zero address");
+        require(votingPeriod_ > 0 && quorumBps_ > 0 && quorumBps_ <= BPS && snapshotLookback_ >= 1, "bad params");
         token = token_;
         core = core_;
         votingPeriod = votingPeriod_;
         timelockDelay = timelockDelay_;
         proposalThreshold = proposalThreshold_;
-        quorumVoters = quorumVoters_;
+        quorumBps = quorumBps_;
+        minQuorum = minQuorum_;
+        snapshotLookback = snapshotLookback_;
+        guardian = guardian_;
     }
 
     // =====================================================================
@@ -127,7 +148,7 @@ contract CrowdfundDAO is ReentrancyGuard {
         uint256 len = bytes(description).length;
         if (len == 0 || len > 500) revert InvalidDescription();
 
-        uint256 snapshot = block.number - 1;
+        uint256 snapshot = block.number > snapshotLookback ? block.number - snapshotLookback : 0;
         uint256 power = token.getPastVotes(msg.sender, snapshot);
         if (power < proposalThreshold) revert BelowThreshold(power, proposalThreshold);
 
@@ -148,6 +169,7 @@ contract CrowdfundDAO is ReentrancyGuard {
                 eta: 0,
                 queued: false,
                 executed: false,
+                canceled: false,
                 forVotes: 0,
                 againstVotes: 0,
                 voters: 0,
@@ -158,7 +180,7 @@ contract CrowdfundDAO is ReentrancyGuard {
     }
 
     // =====================================================================
-    //  Vote quadratique pondéré par snapshot
+    //  Vote linéaire pondéré par snapshot
     // =====================================================================
 
     function castVote(uint256 id, bool support) external {
@@ -167,7 +189,7 @@ contract CrowdfundDAO is ReentrancyGuard {
         if (hasVoted[id][msg.sender]) revert AlreadyVoted();
 
         uint256 balance = token.getPastVotes(msg.sender, p.snapshotBlock);
-        uint256 weight = Math.sqrt(balance / 1e18); // CFD entiers -> poids quadratique
+        uint256 weight = balance; // vote linéaire exact : 1 CFD = 1 voix (aucun arrondi)
         if (weight == 0) revert NoVotingPower();
 
         hasVoted[id][msg.sender] = true;
@@ -178,11 +200,11 @@ contract CrowdfundDAO is ReentrancyGuard {
         emit VoteCast(id, msg.sender, support, weight, balance);
     }
 
-    /// @notice Poids de vote quadratique d'un compte pour la proposition `id` (lecture front-end).
+    /// @notice Poids de vote linéaire d'un compte pour la proposition `id` (lecture front-end).
     function votingWeight(uint256 id, address account) external view returns (uint256 weight, uint256 rawBalance) {
         Proposal storage p = _get(id);
         rawBalance = token.getPastVotes(account, p.snapshotBlock);
-        weight = Math.sqrt(rawBalance / 1e18);
+        weight = rawBalance;
     }
 
     // =====================================================================
@@ -201,6 +223,18 @@ contract CrowdfundDAO is ReentrancyGuard {
         p.queued = true;
         p.eta = uint64(block.timestamp + timelockDelay);
         emit ProposalQueued(id, p.eta);
+    }
+
+    /// @notice VETO : le multisig (guardian) annule une proposition en file d'attente (timelock).
+    ///         Il ne peut qu'annuler : aucune approbation ni exécution n'est possible par cette voie.
+    function cancel(uint256 id, string calldata reason) external {
+        if (msg.sender != guardian) revert NotGuardian();
+        ProposalState s = state(id);
+        if (s != ProposalState.Queued) revert WrongState(s);
+        Proposal storage p = _proposals[id];
+        p.canceled = true;
+        openProposal[keccak256(abi.encode(p.kind, p.campaignId))] = false;
+        emit ProposalCanceled(id, msg.sender, reason); // motif public : transparence du veto
     }
 
     /// @notice Exécute la proposition une fois le timelock écoulé (et avant expiration).
@@ -280,12 +314,15 @@ contract CrowdfundDAO is ReentrancyGuard {
     function state(uint256 id) public view returns (ProposalState) {
         Proposal storage p = _get(id);
         if (p.executed) return ProposalState.Executed;
+        if (p.canceled) return ProposalState.Canceled;
         if (p.queued) {
             if (block.timestamp > p.eta + GRACE_PERIOD) return ProposalState.Expired;
             return ProposalState.Queued;
         }
         if (block.timestamp < p.voteEnd) return ProposalState.Active;
-        bool quorumReached = p.voters >= quorumVoters;
+        // Quorum sur les votes POUR : forVotes >= quorumBps % de l'offre de CFD au snapshot ET >= minQuorum (plancher absolu).
+        uint256 supply = token.getPastTotalSupply(p.snapshotBlock);
+        bool quorumReached = p.forVotes * BPS >= supply * quorumBps && p.forVotes >= minQuorum;
         if (!quorumReached || p.forVotes <= p.againstVotes) return ProposalState.Defeated;
         return ProposalState.Succeeded;
     }

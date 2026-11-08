@@ -1,2 +1,4 @@
 web3>=7,<8
 pandas>=2
+numpy>=1.26
+scikit-learn>=1.4

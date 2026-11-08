@@ -20,18 +20,28 @@ Usage :
   python analysis/fraud_detector.py                      # RPC + adresses lus dans frontend/contracts.json
   python analysis/fraud_detector.py --rpc http://127.0.0.1:8545 --out analysis/reports
   python analysis/fraud_detector.py --campaign 3 --threshold 50
+  python analysis/fraud_detector.py --watch 20 --fast    # surveillance EN CONTINU (rapport mis à jour toutes les 20 s)
+  python analysis/fraud_detector.py --no-ml              # heuristiques seules
+
+COUCHE IA (analysis/ml_model.py) : un Random Forest (scikit-learn), entraîné sur des campagnes simulées
+(organiques vs Sybil / wash-funding / baleine), estime une probabilité de fraude (à partir de 5 contributions, sinon données insuffisantes). Score final =
+50 % heuristiques (explicables) + 50 % modèle ML. Les métriques (précision, rappel, AUC) vont dans
+analysis/reports/ml_metrics.json.
 """
 import argparse
 import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pandas as pd
 from web3 import Web3
 
 ROOT = Path(__file__).resolve().parent.parent
 WEI = 10**18
 
+MIN_CONTRIB_ML = 5
+_CACHE = {}   # modèle ML + dernière signature du rapport (mode --watch)
 WEIGHTS = {"H1": 25, "H2": 20, "H3": 25, "H4": 15, "H5": 20, "H6": 15}
 
 
@@ -167,6 +177,18 @@ def analyse(args) -> int:
         contrib = pd.DataFrame(columns=["id", "contributor", "amount", "block", "timestamp"])
     contrib = contrib.rename(columns={"contributor": "contributor"})
 
+    model = None
+    if not args.no_ml:
+        try:
+            from ml_model import FraudModel, extract
+            if "model" not in _CACHE:  # entraîné UNE fois, réutilisé à chaque passage en mode --watch
+                _CACHE["model"] = FraudModel().fit()
+                m = _CACHE["model"].metrics["cross_validation_5_fold"]
+                print(f"[IA] Random Forest entraîné : précision {m['precision']}, rappel {m['recall']}, AUC {m['roc_auc']} (validation croisée 5 plis)")
+            model = _CACHE["model"]
+        except ImportError:
+            print("[IA] scikit-learn absent : pip install -r analysis/requirements.txt  (heuristiques seules)")
+
     results = []
     for _, camp in created.iterrows():
         cid = int(camp["id"])
@@ -184,7 +206,16 @@ def analyse(args) -> int:
         }
         score = sum(WEIGHTS[k] * v for k, (v, _) in checks.items())
         score = int(min(100, round(score * 100 / sum(WEIGHTS.values()) * 1.6)))  # normalisation : 2-3 signaux => zone rouge
+        heuristic_score, ml_score = score, None
         flags = [f"{k}: {msg}" for k, (v, msg) in checks.items() if v > 0 and msg]
+        # Le ML n'a de sens qu'avec assez de données : < 5 contributions => on s'en tient aux heuristiques.
+        if model is not None and len(c) >= MIN_CONTRIB_ML:
+            vec = extract(c, int(camp["goal"]), int(camp["timestamp"]), int(camp["deadline"]), 1.0 if checks["H5"][0] > 0 else 0.0)
+            p_fraud, why = model.score(vec)
+            ml_score = int(round(p_fraud * 100))
+            score = int(round(0.5 * heuristic_score + 0.5 * ml_score))
+            if ml_score >= 50:
+                flags.append(f"IA: le modèle Random Forest estime la probabilité de fraude à {ml_score} % (facteurs : {', '.join(why)})")
         level = "ÉLEVÉ" if score >= args.threshold else "MODÉRÉ" if score >= args.threshold / 2 else "FAIBLE"
         results.append({
             "campaign_id": cid,
@@ -196,6 +227,8 @@ def analyse(args) -> int:
             "contributions": len(c),
             "unique_contributors": int(c["contributor"].nunique()) if not c.empty else 0,
             "risk_score": score,
+            "heuristic_score": heuristic_score,
+            "ml_score": ml_score,
             "risk_level": level,
             "flags": flags,
             "recommendation": ("Proposer un GEL préventif à la DAO (propose type=1) et examiner manuellement."
@@ -203,21 +236,28 @@ def analyse(args) -> int:
         })
 
     df = pd.DataFrame(results).sort_values("risk_score", ascending=False)
-    print("\n=== RAPPORT DE RISQUE ===")
-    print(df[["campaign_id", "cid", "raised_eth", "contributions", "unique_contributors", "risk_score", "risk_level"]]
-          .to_string(index=False))
-    for r in results:
-        if r["flags"]:
-            print(f"\n[Campagne #{r['campaign_id']}] score {r['risk_score']}/100 ({r['risk_level']})")
-            for f in r["flags"]:
-                print("  -", f)
-            print("  =>", r["recommendation"])
+    sig = [(r["campaign_id"], r["risk_score"], r["contributions"]) for r in results]
+    changed = sig != _CACHE.get("sig")
+    _CACHE["sig"] = sig
+    if changed or not args.watch:  # en surveillance, on n'affiche le détail que si quelque chose a changé
+        print("\n=== RAPPORT DE RISQUE ===")
+        print(df[["campaign_id", "cid", "raised_eth", "contributions", "unique_contributors", "heuristic_score", "ml_score", "risk_score", "risk_level"]]
+              .to_string(index=False))
+        for r in results:
+            if r["flags"]:
+                print(f"\n[Campagne #{r['campaign_id']}] score {r['risk_score']}/100 ({r['risk_level']})")
+                for f in r["flags"]:
+                    print("  -", f)
+                print("  =>", r["recommendation"])
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     df.assign(flags=df["flags"].apply(lambda x: " | ".join(x))).to_csv(out / "fraud_report.csv", index=False, encoding="utf-8-sig")
     (out / "fraud_report.json").write_text(json.dumps(sorted(results, key=lambda r: -r["risk_score"]), indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nRapports écrits dans {out}/ (fraud_report.csv, fraud_report.json)")
+    if model is not None:
+        model.save_metrics(out / "ml_metrics.json")
+    if changed or not args.watch:
+        print(f"\nRapports écrits dans {out}/ (fraud_report.csv, fraud_report.json)")
     return 0
 
 
@@ -228,8 +268,24 @@ def main():
     p.add_argument("--out", default=str(ROOT / "analysis" / "reports"))
     p.add_argument("--campaign", type=int, default=None, help="n'analyser qu'une campagne")
     p.add_argument("--threshold", type=int, default=50, help="score à partir duquel le risque est ÉLEVÉ")
+    p.add_argument("--no-ml", action="store_true", help="désactive la couche IA (Random Forest)")
+    p.add_argument("--watch", type=int, nargs="?", const=20, default=None, metavar="SECONDES",
+                   help="surveillance continue : relance l'analyse toutes les N secondes (défaut 20) et met à jour le rapport en temps réel")
     p.add_argument("--fast", action="store_true", help="saute H5 (parcours des blocs, lent sur réseau public)")
-    sys.exit(analyse(p.parse_args()))
+    args = p.parse_args()
+    if args.watch is None:
+        sys.exit(analyse(args))
+    import time
+    print(f"[SURVEILLANCE] analyse toutes les {args.watch} s — Ctrl+C pour arrêter")
+    while True:
+        try:
+            analyse(args)
+        except SystemExit as e:  # nœud arrêté / contrats pas encore déployés : on réessaie sans quitter
+            print(f"[SURVEILLANCE] en attente… ({e})" if str(e) not in ("0", "None") else "")
+            _CACHE.pop("sig", None)
+        except Exception as e:  # noqa: BLE001
+            print(f"[SURVEILLANCE] erreur temporaire : {e}")
+        time.sleep(args.watch)
 
 
 if __name__ == "__main__":

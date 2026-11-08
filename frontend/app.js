@@ -22,7 +22,7 @@ const S = {
 };
 const STATUS = ["Active", "Successful", "Failed", "Canceled"];
 const STATUS_FR = ["En cours", "Réussie", "Échouée", "Annulée / gelée"];
-const PSTATE_FR = ["En attente", "Vote en cours", "Rejetée", "Adoptée", "En timelock", "Exécutée", "Expirée"];
+const PSTATE_FR = ["En attente", "Vote en cours", "Rejetée", "Adoptée", "En timelock", "Exécutée", "Expirée", "Annulée (veto)"];
 const PAGE_SIZE = 9;
 const CATS = ["Éducation", "Technologie", "Environnement", "Santé", "Art & culture", "Communauté", "Finance"];
 
@@ -95,28 +95,57 @@ async function refreshNow() {
 }
 
 // ------------------------------------------------------------------ métadonnées (IPFS)
+let LOCAL_CIDS = null; // frontend/metadata/cids.json : nom de fichier -> vrai CID IPFS (écrit par `npm run pin`)
+const fetchJson = async (url, ms = 5000) => {
+  const ac = new AbortController(), t = setTimeout(() => ac.abort(), ms);
+  try { const r = await fetch(url, { signal: ac.signal }); if (!r.ok) throw new Error("HTTP " + r.status); return await r.json(); }
+  finally { clearTimeout(t); }
+};
 async function loadMeta(cid) {
   if (S.meta.has(cid)) return S.meta.get(cid);
   let m = { title: "Campagne " + short(cid), description: "", category: "Communauté", image: "" };
   try {
-    if (cid.startsWith("file:")) m = await (await fetch(`metadata/${encodeURIComponent(cid.slice(5))}.json`)).json();
+    if (cid.startsWith("file:")) m = await fetchJson(`metadata/${encodeURIComponent(cid.slice(5))}.json`);
     else if (cid.startsWith("local:")) m = JSON.parse(localStorage.getItem("meta:" + cid) || "null") || m;
     else {
-      const gw = localStorage.getItem("gateway") || "https://ipfs.io/ipfs/";
-      m = await (await fetch(gw + cid)).json();
+      const id = cid.replace(/^ipfs:\/\//, "");
+      const cached = localStorage.getItem("meta:" + id);
+      if (cached) { m = JSON.parse(cached); S.meta.set(cid, m); return m; }
+      // 1) copie locale du fichier épinglé (instantané) ; 2) sinon passerelles IPFS en parallèle, avec délai maximal.
+      try {
+        LOCAL_CIDS ??= await fetchJson("metadata/cids.json", 2000).catch(() => ({}));
+        const name = Object.keys(LOCAL_CIDS).find((k) => LOCAL_CIDS[k] === id);
+        if (name) m = await fetchJson("metadata/" + encodeURIComponent(name), 2000);
+        else throw new Error("pas de copie locale");
+      } catch {
+        const gws = [localStorage.getItem("gateway"), "https://gateway.pinata.cloud/ipfs/", "https://ipfs.io/ipfs/", "https://cloudflare-ipfs.com/ipfs/"].filter(Boolean);
+        m = await Promise.any(gws.map((gw) => fetchJson(gw + id, 6000)));
+      }
     }
   } catch (e) { console.warn("métadonnées indisponibles", cid, e); }
   S.meta.set(cid, m); return m;
 }
+// Épingle un JSON sur Pinata. Clé sans droit « pinJSONToIPFS » (403) : repli sur « pinFileToIPFS ».
+async function pinataPin(jwt, name, obj) {
+  let r = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + jwt },
+    body: JSON.stringify({ pinataContent: obj, pinataMetadata: { name } }),
+  });
+  if (r.status === 403) {
+    const form = new FormData();
+    form.append("file", new Blob([JSON.stringify(obj)], { type: "application/json" }), name + ".json");
+    r = await fetch("https://api.pinata.cloud/pinning/pinFileToIPFS", { method: "POST", headers: { Authorization: "Bearer " + jwt }, body: form });
+  }
+  return r;
+}
 async function uploadMeta(obj) {
   const jwt = localStorage.getItem("pinataJwt");
   if (jwt) {
-    const r = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", {
-      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + jwt },
-      body: JSON.stringify({ pinataContent: obj }),
-    });
-    if (!r.ok) throw new Error("Pinata: " + r.status);
-    return (await r.json()).IpfsHash;
+    const r = await pinataPin(jwt, "campagne-" + Date.now(), obj);
+    if (!r.ok) throw new Error("Pinata: " + r.status + " (vérifiez le jeton dans ⚙ : droit pinJSONToIPFS ou pinFileToIPFS)");
+    const cid = (await r.json()).IpfsHash;
+    try { localStorage.setItem("meta:" + cid, JSON.stringify(obj)); } catch { /* ignore */ } // affichage immédiat dans CE navigateur
+    return cid;
   }
   // Repli de démo : stockage local au navigateur (visible uniquement ici !)
   const id = "local:" + ethers.id(JSON.stringify(obj)).slice(2, 18);
@@ -130,15 +159,17 @@ async function init() {
   catch { app.innerHTML = `<div class="alert bad">Fichier <code>contracts.json</code> introuvable. Déployez d'abord les contrats : <code>npx hardhat run scripts/deploy.js --network localhost</code>.</div>`; return; }
   S.read = new ethers.JsonRpcProvider(S.cfg.rpcUrl, S.cfg.chainId, { staticNetwork: true });
   bind(S.read);
-  try { S.fraud = Object.fromEntries((await (await fetch("../analysis/reports/fraud_report.json", { cache: "no-store" })).json()).map((r) => [r.campaign_id, r])); } catch { S.fraud = {}; }
+  await loadFraud();
+  setInterval(loadFraud, 5000); // le script Python (--watch) réécrit le rapport en continu : on le relit en temps réel
   $("#connect").onclick = connect;
   $("#settings").onclick = openSettings;
   if (DEV && S.cfg.chainId === 31337) { await initDev(); }
   else if (window.ethereum) {
     window.ethereum.on?.("accountsChanged", () => location.reload());
     window.ethereum.on?.("chainChanged", () => location.reload());
-    const accts = await window.ethereum.request({ method: "eth_accounts" }).catch(() => []);
-    if (accts.length) await connect(true);
+    // La reconnexion silencieuse se fait EN ARRIÈRE-PLAN : si MetaMask est bloqué ou lent, la page s'affiche quand même.
+    const limit = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(() => r(null), ms))]);
+    limit(window.ethereum.request({ method: "eth_accounts" }).catch(() => []), 4000).then((a) => { if (a && a.length) return connect(true); });
   }
   window.addEventListener("hashchange", route);
   await refreshNow();
@@ -150,6 +181,10 @@ async function init() {
     await refreshNow().catch(() => {});
     route();
   }, 4000);
+}
+async function loadFraud() {
+  try { S.fraud = Object.fromEntries((await (await fetch("../analysis/reports/fraud_report.json", { cache: "no-store" })).json()).map((r) => [r.campaign_id, r])); }
+  catch { /* rapport absent : on garde le précédent */ S.fraud = S.fraud || {}; }
 }
 function bind(runner) {
   for (const k of ["token", "core", "dao", "treasury"]) S.c[k] = new ethers.Contract(S.cfg.addresses[k], S.cfg.abis[k], runner);
@@ -175,7 +210,10 @@ async function connect(silent) {
   if (!window.ethereum) { toast("MetaMask non détecté. Installez l'extension https://metamask.io", "bad"); return; }
   try {
     S.web3 = new ethers.BrowserProvider(window.ethereum);
-    await S.web3.send("eth_requestAccounts", []);
+    if (silent !== true) toast("Ouverture de MetaMask… regardez l'icône 🦊 de l'extension (fenêtre de connexion).");
+    // Si MetaMask ne répond pas, on le dit au lieu de rester muet.
+    const hint = silent === true ? null : setTimeout(() => toast("MetaMask ne répond pas. 1) Cliquez sur l'icône 🦊 et déverrouillez-le ; 2) une demande est peut-être déjà en attente dans l'extension ; 3) sinon, test local sans MetaMask : ajoutez ?dev=1 à l'adresse.", "bad"), 12000);
+    try { await S.web3.send("eth_requestAccounts", []); } finally { clearTimeout(hint); }
     const net = await S.web3.getNetwork();
     if (Number(net.chainId) !== S.cfg.chainId) {
       await switchChain();
@@ -188,7 +226,10 @@ async function connect(silent) {
     const n = $("#net"); n.textContent = S.cfg.network + " · " + S.cfg.chainId; n.classList.remove("hidden");
     if (silent !== true) toast("Connecté : " + short(S.account), "ok");
     route();
-  } catch (e) { console.error(e); if (silent !== true) toast(decodeErr(e), "bad"); }
+  } catch (e) {
+    console.error(e);
+    if (silent !== true) toast(e?.code === -32002 || /already pending/i.test(e?.message || "") ? "Une demande de connexion est déjà en attente : cliquez sur l'icône 🦊 de MetaMask et validez-la." : decodeErr(e), "bad");
+  }
 }
 async function switchChain() {
   const hex = "0x" + S.cfg.chainId.toString(16);
@@ -224,14 +265,18 @@ async function testPinata(jwt, gw) {
   try {
     say("1/3 Authentification…");
     const a = await fetch("https://api.pinata.cloud/data/testAuthentication", { headers: { Authorization: "Bearer " + jwt } });
-    if (!a.ok) return say(`✗ Jeton refusé par Pinata (HTTP ${a.status}). Vérifiez le JWT (droit « pinJSONToIPFS »).`, true);
+    if (!a.ok) return say(`✗ Jeton refusé par Pinata (HTTP ${a.status}). Vérifiez le JWT (copiez-le en entier, il commence par eyJ).`, true);
     say("2/3 Épinglage d'un JSON de test…");
-    const p = await fetch("https://api.pinata.cloud/pinning/pinJSONToIPFS", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + jwt }, body: JSON.stringify({ pinataContent: { test: "CrowdFund DAO", t: Date.now() } }) });
+    const p = await pinataPin(jwt, "test-" + Date.now(), { test: "crowdfund-dao", at: new Date().toISOString() });
     if (!p.ok) return say(`✗ Épinglage refusé (HTTP ${p.status}).`, true);
     const cid = (await p.json()).IpfsHash;
     say(`3/3 Relecture de ${cid} via la passerelle…`);
-    const g = await fetch(gw + cid);
-    say(g.ok ? `✓ Tout fonctionne. CID de test : ${cid}` : `✓ Pinata OK (CID ${cid}) mais la passerelle répond HTTP ${g.status} : réessayez dans une minute ou changez de passerelle.`, !g.ok);
+    try {
+      const g = await fetch(gw + cid);
+      say(g.ok ? `✓ Tout fonctionne. CID de test : ${cid}` : `✓ Épinglage Pinata OK (CID ${cid}). La passerelle répond HTTP ${g.status} : utilisez votre passerelle dédiée Pinata (voir ci-dessous).`, !g.ok);
+    } catch {
+      say(`✓ Épinglage Pinata OK (CID ${cid}). Mais cette passerelle est inaccessible depuis le navigateur (CORS / blocage) : saisissez votre passerelle dédiée Pinata, ex. https://VOTRE-NOM.mypinata.cloud/ipfs/ (Pinata > Gateways).`, true);
+    }
   } catch (e) { say("✗ Erreur réseau : " + (e.message || e), true); }
 }
 
@@ -270,7 +315,7 @@ function trancheRows(c) {
 const tile = (label, value, sub = "") => `<div class="tile"><small>${label}</small><b>${value}</b>${sub ? `<em>${sub}</em>` : ""}</div>`;
 function propCard(i, p, s) {
   const f = Number(p.forVotes), a = Number(p.againstVotes), tot = f + a || 1;
-  const cls = s === 5 ? "ok" : s === 2 || s === 6 ? "bad" : s === 1 ? "warn" : "";
+  const cls = s === 5 ? "ok" : s === 2 || s === 6 || s === 7 ? "bad" : s === 1 ? "warn" : "";
   return `<div class="panel prop2">
     <div class="row"><div><span class="muted small">Proposition n°${i}</span><div class="prop-title">${p.kind === 0n ? "✔ Valider une tranche" : "❄ Geler la campagne"}</div></div>
       <span class="pill ${cls}">${PSTATE_FR[s]}</span></div>
@@ -318,7 +363,7 @@ async function viewHome() {
       <div class="stat"><b>${all.length}</b><span>campagnes</span></div>
       <div class="stat"><b>${active}</b><span>en cours</span></div>
       <div class="stat"><b>${eth(totalRaised, 2)} ETH</b><span>levés au total</span></div>
-      <div class="stat"><b>${S.cfg.params.quorumVoters}</b><span>votants min. (quorum DAO)</span></div>
+      <div class="stat"><b>${S.cfg.params.quorumPercent} %</b><span>quorum DAO (votes « pour »)</span></div>
     </div>
   </section>
   <div class="layout">
@@ -628,11 +673,11 @@ async function viewDao() {
     <div class="panel"><b>${P.proposalThresholdCFD} CFD</b><div class="muted small">pour proposer</div></div>
     <div class="panel"><b>${dur(P.votingPeriod)}</b><div class="muted small">période de vote</div></div>
     <div class="panel"><b>${dur(P.timelockDelay)}</b><div class="muted small">timelock avant exécution</div></div>
-    <div class="panel"><b>${P.quorumVoters} votants</b><div class="muted small">quorum minimal</div></div>
+    <div class="panel"><b>${P.quorumPercent} %</b><div class="muted small">quorum (votes « pour », min. ${P.minQuorumCFD} CFD)</div></div>
     <div class="panel"><b>${eth(treasuryBal, 3)} ETH</b><div class="muted small">trésorerie multisig (+ ${eth(fees, 3)} à transférer)</div></div>
   </div>
   ${paused ? `<div class="alert bad">⏸ Plateforme en pause (circuit breaker).</div>` : ""}
-  <div class="alert info small"><b>Comment votez-vous ?</b> Poids = √(CFD détenus au <i>snapshot</i>) — vote quadratique : 4× plus de jetons = 2× plus de voix. Les jetons acquis après la création de la proposition ne comptent pas (anti flash-loan).
+  <div class="alert info small"><b>Comment votez-vous ?</b> Poids = CFD détenus au <i>snapshot</i> (1 CFD = 1 voix) — fractionner ses fonds sur plusieurs adresses ne donne aucun avantage. Le quorum se compte sur les votes « pour ». Le multisig peut opposer son veto pendant le timelock. Les jetons acquis après la création de la proposition ne comptent pas (anti flash-loan).
   ${S.fraud && Object.keys(S.fraud).length ? "" : ""}</div>
   ${items.length ? items.map(propHtml).join("") : `<div class="panel">Aucune proposition. Ouvrez une campagne pour en créer une.</div>`}
   ${S.cfg.addresses.treasury ? `<p class="muted small">Contrats : DAO <span class="mono">${esc(S.cfg.addresses.dao)}</span> · Core <span class="mono">${esc(S.cfg.addresses.core)}</span> · CFD <span class="mono">${esc(S.cfg.addresses.token)}</span></p>` : ""}
@@ -646,16 +691,16 @@ function propHtml({ i, p, s, w, voted, meta }) {
   const f = Number(p.forVotes), a = Number(p.againstVotes), tot = f + a || 1;
   const end = Number(p.voteEnd), eta = Number(p.eta);
   const act = [];
-  if (s === 1 && !voted && w[0] > 0n) act.push(`<button data-act="yes" data-i="${i}" class="primary">Pour (poids ${w[0]})</button><button data-act="no" data-i="${i}">Contre</button>`);
+  if (s === 1 && !voted && w[0] > 0n) act.push(`<button data-act="yes" data-i="${i}" class="primary">Pour (poids ${cfd(w[0])})</button><button data-act="no" data-i="${i}">Contre</button>`);
   if (s === 1 && voted) act.push(`<span class="pill ok">Vous avez voté</span>`);
   if (s === 1 && !voted && w[0] === 0n && S.account) act.push(`<span class="muted small">Pas de pouvoir de vote au snapshot.</span>`);
   if (s === 3) act.push(`<span class="pill warn">Adoptée : mise en file en cours…</span>`);
   if (s === 4) act.push(eta <= S.now ? `<span class="pill warn">Timelock écoulé : exécution en cours…</span>` : `<span class="pill warn">Timelock : ${dur(eta - S.now)}</span>`);
   return `<div class="panel prop">
-    <div class="row"><b>#${i} · ${p.kind === 0n ? "✔ Valider une tranche" : "❄ Geler la campagne"} — <a href="#/campaign/${p.campaignId}">${esc(meta.title)}</a></b><span class="pill ${s === 5 ? "ok" : s === 2 || s === 6 ? "bad" : ""}">${PSTATE_FR[s]}</span></div>
+    <div class="row"><b>#${i} · ${p.kind === 0n ? "✔ Valider une tranche" : "❄ Geler la campagne"} — <a href="#/campaign/${p.campaignId}">${esc(meta.title)}</a></b><span class="pill ${s === 5 ? "ok" : s === 2 || s === 6 || s === 7 ? "bad" : ""}">${PSTATE_FR[s]}</span></div>
     <p class="muted">${esc(p.description)}</p>
-    <div class="vote" aria-label="Pour ${f}, contre ${a}"><div class="y" style="width:${(f / tot) * 100}%"></div><div class="n" style="width:${(a / tot) * 100}%"></div></div>
-    <div class="row muted small"><span>Pour ${f} · Contre ${a}</span><span>${p.voters} votant(s) / quorum ${S.cfg.params.quorumVoters}</span><span>${s === 1 ? "fin du vote dans " + dur(end - S.now) : "snapshot bloc " + p.snapshotBlock}</span></div>
+    <div class="vote" aria-label="Pour ${cfd(p.forVotes)}, contre ${cfd(p.againstVotes)}"><div class="y" style="width:${(f / tot) * 100}%"></div><div class="n" style="width:${(a / tot) * 100}%"></div></div>
+    <div class="row muted small"><span>Pour ${cfd(p.forVotes)} · Contre ${cfd(p.againstVotes)}</span><span>${p.voters} votant(s) · quorum ${S.cfg.params.quorumPercent} % de l'offre en « pour »</span><span>${s === 1 ? "fin du vote dans " + dur(end - S.now) : "snapshot bloc " + p.snapshotBlock}</span></div>
     <div class="actions">${act.join("")}</div></div>`;
 }
 

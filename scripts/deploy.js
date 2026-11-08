@@ -12,15 +12,23 @@ async function main() {
 
   // Paramètres de gouvernance : courts en local (démo), réalistes sur testnet.
   const votingPeriod = Number(process.env.VOTING_PERIOD || (isLocal ? 300 : 3 * 24 * 3600));
-  const timelockDelay = Number(process.env.TIMELOCK_DELAY || (isLocal ? 60 : 24 * 3600));
+  const timelockDelay = Number(process.env.TIMELOCK_DELAY || (isLocal ? 60 : 48 * 3600));
   const threshold = ethers.parseEther(process.env.PROPOSAL_THRESHOLD_CFD || (isLocal ? "10" : "100"));
-  const quorumVoters = Number(process.env.QUORUM_VOTERS || (isLocal ? 2 : 5));
+  // Quorum sur les votes POUR, en points de base de l'offre au snapshot (1000 = 10 %).
+  const quorumBps = Number(process.env.QUORUM_BPS || 1000);
+  // Plancher absolu du quorum (CFD) : évite qu'un attaquant atteigne 10 % quand l'offre est encore minuscule.
+  const minQuorum = ethers.parseEther(process.env.MIN_QUORUM_CFD || (isLocal ? "100" : "1000"));
+  // Maturité du snapshot (blocs) : 7200 blocs ≈ 24 h sur Ethereum ; 1 en local. Réduire pour une démo Sepolia.
+  const snapshotLookback = Number(process.env.SNAPSHOT_LOOKBACK || (isLocal ? 1 : 7200));
 
   // Propriétaires du multisig : en local 3 comptes de test ; sinon MULTISIG_OWNERS="0x..,0x..,0x.." (2 sur 3).
   const owners = process.env.MULTISIG_OWNERS
     ? process.env.MULTISIG_OWNERS.split(",").map((s) => s.trim())
     : isLocal ? [signers[17].address, signers[18].address, signers[19].address] : [deployer.address];
   const required = Number(process.env.MULTISIG_REQUIRED || (owners.length >= 3 ? 2 : 1));
+  // Garde-fou : hors local, le multisig doit être un vrai 2-sur-3 (sinon le veto et l'administration dépendent d'une seule personne).
+  if (!isLocal && !process.env.ALLOW_WEAK_MULTISIG && (new Set(owners.map((o) => o.toLowerCase())).size < 3 || required < 2))
+    throw new Error("Multisig faible : fournissez MULTISIG_OWNERS=\"0x..,0x..,0x..\" (3 adresses distinctes, 2 signatures) ou ALLOW_WEAK_MULTISIG=1 pour une démo.");
   // Seuil du multisig : au-dessus (ou pour un appel de contrat) -> `required` signatures obligatoires.
   const smallLimit = ethers.parseEther(process.env.MULTISIG_SMALL_LIMIT_ETH || "0.1");
 
@@ -52,12 +60,24 @@ async function main() {
     await core.waitForDeployment();
   }
   const dao = await (await ethers.getContractFactory("CrowdfundDAO")).deploy(
-    await token.getAddress(), await core.getAddress(), votingPeriod, timelockDelay, threshold, quorumVoters);
+    await token.getAddress(), await core.getAddress(), votingPeriod, timelockDelay, threshold, quorumBps, minQuorum, snapshotLookback, await treasury.getAddress()); // guardian = multisig (veto)
   await dao.waitForDeployment();
 
   // Câblage des rôles (principe du moindre privilège)
   await (await token.grantRole(await token.MINTER_ROLE(), await core.getAddress())).wait();
   await (await core.grantRole(await core.GOVERNANCE_ROLE(), await dao.getAddress())).wait();
+
+  // Droits d'administration : transférés au multisig puis retirés au déployeur (sinon un seul compte pourrait
+  // s'accorder MINTER/GOVERNANCE et contourner la DAO). PAUSER_ROLE reste au déployeur (réaction rapide).
+  if (process.env.KEEP_ADMIN !== "1") {
+    const ADMIN = await token.DEFAULT_ADMIN_ROLE();
+    const ms = await treasury.getAddress();
+    for (const c of [token, core]) {
+      await (await c.grantRole(ADMIN, ms)).wait();
+      await (await c.renounceRole(ADMIN, deployer.address)).wait();
+    }
+    console.log("DEFAULT_ADMIN_ROLE transféré au multisig et retiré au déployeur.");
+  }
 
   const net = await ethers.provider.getNetwork();
   const out = {
@@ -66,7 +86,7 @@ async function main() {
     // URL publique pour la dApp (ne JAMAIS y mettre la clé Infura/Alchemy privée du .env)
     rpcUrl: isLocal ? "http://127.0.0.1:8545" : (process.env.PUBLIC_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com"),
     deployedAtBlock: await ethers.provider.getBlockNumber(),
-    params: { votingPeriod, timelockDelay, proposalThresholdCFD: ethers.formatEther(threshold), quorumVoters, multisigRequired: required, multisigSmallLimitETH: ethers.formatEther(smallLimit) },
+    params: { votingPeriod, timelockDelay, proposalThresholdCFD: ethers.formatEther(threshold), quorumBps, quorumPercent: quorumBps / 100, minQuorumCFD: ethers.formatEther(minQuorum), snapshotLookback, multisigRequired: required, multisigSmallLimitETH: ethers.formatEther(smallLimit) },
     addresses: {
       token: await token.getAddress(), core: await core.getAddress(),
       dao: await dao.getAddress(), treasury: await treasury.getAddress(),

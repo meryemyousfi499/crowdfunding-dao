@@ -16,7 +16,18 @@ MULTISIG_OWNERS=0xAdresse1,0xAdresse2,0xAdresse3
 # Optionnel : vérifier le code sur Etherscan
 ETHERSCAN_API_KEY=VOTRE_CLE_ETHERSCAN
 ```
-Paramètres par défaut hors local : vote 3 jours, timelock 1 jour, seuil de proposition 100 CFD, quorum 5 votants, multisig 2 sur 3, seuil d'1 signature jusqu'à 0,1 ETH. Pour une démo plus rapide : `VOTING_PERIOD=600`, `TIMELOCK_DELAY=120`, `PROPOSAL_THRESHOLD_CFD=10`, `QUORUM_VOTERS=2` dans le `.env`.
+Paramètres par défaut hors local : vote 3 jours, timelock 48 h, seuil de proposition 100 CFD, quorum 10 % de l'offre (votes « pour »), veto du multisig, multisig 2 sur 3, seuil d'1 signature jusqu'à 0,1 ETH. Pour une démo plus rapide : `VOTING_PERIOD=600`, `TIMELOCK_DELAY=120`, `PROPOSAL_THRESHOLD_CFD=10`, `QUORUM_BPS=1000` dans le `.env`.
+
+## 2bis. Les 3 propriétaires du multisig (obligatoire hors local)
+Le déploiement exige 3 adresses **distinctes** (2 signatures sur 3). Le plus simple :
+```powershell
+npm run owners
+```
+Cela crée `owners.secret.json` (clés privées, ignoré par Git) et affiche la ligne à coller dans `.env` :
+`MULTISIG_OWNERS=0x...,0x...,0x...`
+- **Sauvegardez `owners.secret.json` à deux endroits** (gestionnaire de mots de passe + clé USB). Il faut 2 clés sur 3 pour agir : si vous en perdez 2, plus personne ne peut accorder un rôle, suspendre la plateforme ni opposer le veto (sur testnet, il suffit alors de redéployer).
+- Pour signer depuis la page *Trésorerie*, importez un propriétaire dans MetaMask : *Importer un compte* → clé privée.
+- Le déploiement transfère `DEFAULT_ADMIN_ROLE` **et** `PAUSER_ROLE` au multisig (la pause demande donc 2 signatures). Pour garder la pause au déployeur (réaction plus rapide, mais un seul compte peut suspendre) : `KEEP_PAUSER=1`.
 
 ## 3. Déployer (PowerShell)
 ```powershell
@@ -25,6 +36,11 @@ npx hardhat run scripts/deploy.js --network sepolia
 ```
 Le script affiche les 4 adresses et écrit `frontend/contracts.json` (réseau 11155111, RPC public, jamais votre URL privée).
 Optionnel — données de démo : `npx hardhat run scripts/seed.js --network sepolia` (nécessite assez de comptes financés ; sinon créez vos campagnes depuis la dApp).
+
+## 3bis. Épingler les métadonnées sur IPFS (vrais CID)
+1. Pinata → *API Keys* → *New Key* → copiez le **JWT** dans `.env` : `PINATA_JWT=eyJ...`
+2. `npm run pin` : envoie les 4 fichiers de `frontend/metadata/` et écrit `frontend/metadata/cids.json`.
+3. `npm run backend:seed` (local) utilise alors `ipfs://<CID>` au lieu de `file:<nom>`. Faites une capture de *Pinata → Files* pour le rapport.
 
 ## 4. Vérifier le code sur Etherscan (optionnel, très apprécié en soutenance)
 ```powershell

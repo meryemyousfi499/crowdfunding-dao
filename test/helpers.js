@@ -3,9 +3,11 @@ const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 const DAY = 24 * 3600;
 const VOTING_PERIOD = 3 * DAY;
-const TIMELOCK = 1 * DAY;
+const TIMELOCK = 2 * DAY; // 48 h
 const THRESHOLD = ethers.parseEther("10"); // 10 CFD pour proposer
-const QUORUM_VOTERS = 3;
+const MIN_QUORUM = 0n; // plancher absolu désactivé par défaut dans les tests (testé à part)
+const LOOKBACK = 1; // snapshot = bloc précédent (testé à part avec une valeur plus grande)
+const QUORUM_BPS = 1000; // quorum : 10 % de l'offre, sur les votes POUR
 
 async function deployAll() {
   const [admin, creator, beneficiary, alice, bob, carol, dave, whale, o1, o2, o3] = await ethers.getSigners();
@@ -26,7 +28,10 @@ async function deployAll() {
     VOTING_PERIOD,
     TIMELOCK,
     THRESHOLD,
-    QUORUM_VOTERS
+    QUORUM_BPS,
+    MIN_QUORUM,
+    LOOKBACK,
+    await treasury.getAddress() // guardian : le multisig 2-sur-3 détient le veto
   );
 
   await token.grantRole(await token.MINTER_ROLE(), await core.getAddress());
@@ -40,4 +45,4 @@ async function createCampaign(core, creator, beneficiary, { goal = "10", duratio
   return (await core.campaignCount()) - 1n;
 }
 
-module.exports = { deployAll, createCampaign, time, DAY, VOTING_PERIOD, TIMELOCK, THRESHOLD, QUORUM_VOTERS };
+module.exports = { deployAll, createCampaign, time, DAY, VOTING_PERIOD, TIMELOCK, THRESHOLD, QUORUM_BPS, MIN_QUORUM, LOOKBACK };

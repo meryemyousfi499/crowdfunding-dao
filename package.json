@@ -23,9 +23,12 @@
     "test:fuzz": "hardhat test test/Fuzz.test.js",
     "fund": "hardhat run scripts/fund.js --network localhost",
     "start:local": "node scripts/dev.js",
-    "backend": "npm run deploy:local && npm run keeper",
-    "backend:seed": "npm run deploy:local && npm run seed && npm run keeper",
-    "keeper:sepolia": "hardhat run scripts/keeper.js --network sepolia"
+    "backend": "node scripts/backend.js",
+    "backend:seed": "node scripts/backend.js --seed",
+    "keeper:sepolia": "hardhat run scripts/keeper.js --network sepolia",
+    "owners": "node scripts/make-owners.js",
+    "pin": "node scripts/pin-metadata.js",
+    "fraud": "python analysis/fraud_detector.py --watch 20 --fast"
   },
   "keywords": [],
   "author": "",

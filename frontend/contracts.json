@@ -1,21 +1,24 @@
 {
-  "network": "sepolia",
-  "chainId": 11155111,
-  "rpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
-  "deployedAtBlock": 12082406,
+  "network": "localhost",
+  "chainId": 31337,
+  "rpcUrl": "http://127.0.0.1:8545",
+  "deployedAtBlock": 46,
   "params": {
-    "votingPeriod": 600,
-    "timelockDelay": 120,
+    "votingPeriod": 259200,
+    "timelockDelay": 86400,
     "proposalThresholdCFD": "10.0",
-    "quorumVoters": 2,
+    "quorumBps": 1000,
+    "quorumPercent": 10,
+    "minQuorumCFD": "100.0",
+    "snapshotLookback": 1,
     "multisigRequired": 2,
     "multisigSmallLimitETH": "0.1"
   },
   "addresses": {
-    "token": "0x7c09D70EB9E6Dbb71C21e4494481E573DFc9562E",
-    "core": "0xf98BDB7ff0cdC61C322868C5C6A74d9CE8646aBb",
-    "dao": "0xa5c2890bc5A66cC5fd07B2386B8F1bA677004126",
-    "treasury": "0x04Ae6317eCf45Fc8D7a1aa1e48921C08830bB6bF"
+    "token": "0xB7f8BC63BbcaD18155201308C8f3540b07f84F5e",
+    "core": "0xA51c1fc2f0D1a1b8494Ed1FE312d7C3a78Ed91C0",
+    "dao": "0x0DCd1Bf9A1b36cE34237eEaFef220932846BCD82",
+    "treasury": "0x610178dA211FEF7D417bC0e6FeD39F05609AD788"
   },
   "abis": {
     "token": [
@@ -1859,6 +1862,19 @@
       },
       {
         "inputs": [],
+        "name": "MAX_PAUSE",
+        "outputs": [
+          {
+            "internalType": "uint256",
+            "name": "",
+            "type": "uint256"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [],
         "name": "MIN_CONTRIBUTION",
         "outputs": [
           {
@@ -2344,6 +2360,19 @@
         "type": "function"
       },
       {
+        "inputs": [],
+        "name": "pausedAt",
+        "outputs": [
+          {
+            "internalType": "uint256",
+            "name": "",
+            "type": "uint256"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
         "inputs": [
           {
             "internalType": "uint256",
@@ -2507,6 +2536,13 @@
         "type": "function"
       },
       {
+        "inputs": [],
+        "name": "unpauseExpired",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
         "inputs": [
           {
             "internalType": "uint256",
@@ -2550,8 +2586,23 @@
           },
           {
             "internalType": "uint256",
-            "name": "quorumVoters_",
+            "name": "quorumBps_",
             "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "minQuorum_",
+            "type": "uint256"
+          },
+          {
+            "internalType": "uint256",
+            "name": "snapshotLookback_",
+            "type": "uint256"
+          },
+          {
+            "internalType": "address",
+            "name": "guardian_",
+            "type": "address"
           }
         ],
         "stateMutability": "nonpayable",
@@ -2609,6 +2660,11 @@
         "type": "error"
       },
       {
+        "inputs": [],
+        "name": "NotGuardian",
+        "type": "error"
+      },
+      {
         "inputs": [
           {
             "internalType": "uint256",
@@ -2645,6 +2701,31 @@
         ],
         "name": "WrongState",
         "type": "error"
+      },
+      {
+        "anonymous": false,
+        "inputs": [
+          {
+            "indexed": true,
+            "internalType": "uint256",
+            "name": "id",
+            "type": "uint256"
+          },
+          {
+            "indexed": true,
+            "internalType": "address",
+            "name": "guardian",
+            "type": "address"
+          },
+          {
+            "indexed": false,
+            "internalType": "string",
+            "name": "reason",
+            "type": "string"
+          }
+        ],
+        "name": "ProposalCanceled",
+        "type": "event"
       },
       {
         "anonymous": false,
@@ -2766,6 +2847,19 @@
       },
       {
         "inputs": [],
+        "name": "BPS",
+        "outputs": [
+          {
+            "internalType": "uint256",
+            "name": "",
+            "type": "uint256"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [],
         "name": "GRACE_PERIOD",
         "outputs": [
           {
@@ -2775,6 +2869,24 @@
           }
         ],
         "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          {
+            "internalType": "uint256",
+            "name": "id",
+            "type": "uint256"
+          },
+          {
+            "internalType": "string",
+            "name": "reason",
+            "type": "string"
+          }
+        ],
+        "name": "cancel",
+        "outputs": [],
+        "stateMutability": "nonpayable",
         "type": "function"
       },
       {
@@ -2903,6 +3015,11 @@
                 "type": "bool"
               },
               {
+                "internalType": "bool",
+                "name": "canceled",
+                "type": "bool"
+              },
+              {
                 "internalType": "uint256",
                 "name": "forVotes",
                 "type": "uint256"
@@ -2932,6 +3049,19 @@
         "type": "function"
       },
       {
+        "inputs": [],
+        "name": "guardian",
+        "outputs": [
+          {
+            "internalType": "address",
+            "name": "",
+            "type": "address"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
         "inputs": [
           {
             "internalType": "uint256",
@@ -2950,6 +3080,19 @@
             "internalType": "bool",
             "name": "",
             "type": "bool"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "minQuorum",
+        "outputs": [
+          {
+            "internalType": "uint256",
+            "name": "",
+            "type": "uint256"
           }
         ],
         "stateMutability": "view",
@@ -3057,7 +3200,7 @@
       },
       {
         "inputs": [],
-        "name": "quorumVoters",
+        "name": "quorumBps",
         "outputs": [
           {
             "internalType": "uint256",
@@ -3079,6 +3222,19 @@
         "name": "release",
         "outputs": [],
         "stateMutability": "nonpayable",
+        "type": "function"
+      },
+      {
+        "inputs": [],
+        "name": "snapshotLookback",
+        "outputs": [
+          {
+            "internalType": "uint256",
+            "name": "",
+            "type": "uint256"
+          }
+        ],
+        "stateMutability": "view",
         "type": "function"
       },
       {
@@ -3527,6 +3683,25 @@
       {
         "inputs": [],
         "name": "smallLimit",
+        "outputs": [
+          {
+            "internalType": "uint256",
+            "name": "",
+            "type": "uint256"
+          }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+      },
+      {
+        "inputs": [
+          {
+            "internalType": "uint256",
+            "name": "",
+            "type": "uint256"
+          }
+        ],
+        "name": "smallSpentOnDay",
         "outputs": [
           {
             "internalType": "uint256",

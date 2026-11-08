@@ -1,0 +1,726 @@
+diff --git a/README.md b/README.md
+index c478140..0100540 100644
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,7 @@ Mini-projet Blockchain (ENSA Béni Mellal, IA & Cybersécurité). Solidity 0.8.2
+ 
+ ```
+ contracts/   CFDToken (M1) · CrowdfundingCore (M2) · CrowdfundDAO (M3) · MultiSigTreasury · mocks/ReentrancyAttacker
+-test/        33 tests : unitaires, réentrance, snapshot, quadratique, timelock, gel, multisig (seuil), keeper, fuzzing (fast-check)
++test/        46 tests : unitaires, réentrance, snapshot, vote linéaire anti-Sybil, quorum sur les votes « pour », timelock, veto du multisig, gel, multisig (seuil), keeper, fuzzing (fast-check)
+ scripts/     deploy.js · seed.js (données de démo) · advance-time.js
+ frontend/    dApp M4 (HTML/JS + Ethers.js, sans build) · metadata/ (métadonnées de démo)
+ analysis/    fraud_detector.py (bonus IA hors-chaîne : web3.py + Pandas)
+@@ -24,7 +24,7 @@ pip install -r analysis/requirements.txt        # pour le script Python (ajouter
+ ## 3. Compiler et tester
+ ```bash
+ npx hardhat compile
+-npx hardhat test                  # 29 tests doivent passer
++npx hardhat test                  # 46 tests doivent passer
+ ```
+ > Réseau sans accès à `binaries.soliditylang.org` ? Utilisez le compilateur npm : `USE_SOLCJS=1 npx hardhat test` (ou `npm run test:offline`).
+ 
+@@ -72,7 +72,7 @@ Résultats et corrections : **docs/AUDIT.md**.
+ | Taux CFD | 1 ETH = 1000 CFD, frappés à la contribution, **verrouillés** jusqu'à la livraison complète ; brûlés au remboursement |
+ | Statuts | Active → Réussie / Échouée (à l'échéance) ; Annulée (campagne vide annulée ou gel DAO) |
+ | Retrait | Par tranches (1–5), chacune validée par un vote DAO ; 2 % de frais → trésorerie multisig 2/3 |
+-| Vote | Poids = √(CFD au snapshot) · quorum = nb. minimal de votants · majorité simple · timelock avant exécution |
++| Vote | Poids = CFD au snapshot (vote linéaire) · quorum = 10 % de l'offre en votes « pour » · majorité simple · timelock 48 h · veto du multisig |
+ | Pause | `PAUSER_ROLE` suspend contributions, remboursements, retraits, jetons |
+ 
+ ⚠ Projet pédagogique, contrats **non audités par un tiers** : ne jamais utiliser de fonds réels.
+diff --git a/contracts/CrowdfundDAO.sol b/contracts/CrowdfundDAO.sol
+index 3b93150..82c404d 100644
+--- a/contracts/CrowdfundDAO.sol
++++ b/contracts/CrowdfundDAO.sol
+@@ -1,7 +1,6 @@
+ // SPDX-License-Identifier: MIT
+ pragma solidity ^0.8.24;
+ 
+-import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+ import {CFDToken} from "./CFDToken.sol";
+ import {ICrowdfundingCore} from "./interfaces/ICrowdfundingCore.sol";
+@@ -16,13 +15,20 @@ import {ICrowdfundingCore} from "./interfaces/ICrowdfundingCore.sol";
+  *     token.getPastVotes. Acheter / emprunter des CFD (flash loan) APRÈS la création d'une
+  *     proposition ne donne aucun poids. Les CFD sont de plus verrouillés (non transférables)
+  *     tant qu'une campagne n'est pas livrée.
+- *  2. VOTE QUADRATIQUE : le poids = racine carrée du solde (en CFD entiers) au snapshot.
+- *     Obtenir 2x plus de voix coûte 4x plus de jetons : on réduit l'influence des baleines.
+- *     Limite connue : le vote quadratique est sensible aux attaques Sybil (diviser ses fonds
+- *     sur plusieurs adresses) ; contrepartie : contribution minimale, jetons verrouillés,
+- *     quorum en NOMBRE de votants et détection hors-chaîne (script Python).
++ *  2. VOTE LINÉAIRE : poids = solde exact de CFD (18 décimales, sans arrondi) au snapshot. Les CFD sont verrouillés et
++ *     proportionnels aux ETH engagés : fractionner ses fonds sur 50 adresses donne EXACTEMENT le même
++ *     pouvoir total que sur une seule (aucun avantage Sybil). L'attaquant doit immobiliser du capital réel.
++ *  2bis. QUORUM SUR LES VOTES « POUR » : les votes pour doivent représenter au moins `quorumBps`
++ *     (ex. 10 %) de l'offre totale de CFD au snapshot ET au moins `minQuorum` CFD en valeur absolue
++ *     (plancher : quand l'offre est encore petite, 10 % ne coûterait presque rien à un attaquant). Un attaquant minoritaire seul ne peut pas
++ *     faire passer une proposition : il doit convaincre de vrais contributeurs.
++ *  2ter. MATURITÉ DU SNAPSHOT : le snapshot est pris `snapshotLookback` blocs AVANT la création de la
++ *     proposition. Il faut donc détenir ses CFD depuis un certain temps pour proposer ou voter
++ *     (acheter puis proposer aussitôt ne donne aucun poids).
+  *  3. TIMELOCK : une proposition adoptée doit être « queued » puis attend `timelockDelay`
+  *     avant exécution (fenêtre pour réagir / alerter) ; elle expire après `GRACE_PERIOD`.
++ *  3bis. VETO DU MULTISIG (`guardian`) : pendant le timelock, le multisig 2-sur-3 peut ANNULER une
++ *     proposition adoptée mais malveillante. Il ne peut qu'annuler : jamais approuver ni exécuter.
+  *  4. SEUIL DE PROPOSITION : il faut détenir `proposalThreshold` CFD au snapshot pour proposer.
+  *  5. EFFETS AVANT INTERACTIONS : l'état est mis à jour avant l'appel au Core.
+  */
+@@ -39,7 +45,8 @@ contract CrowdfundDAO is ReentrancyGuard {
+         Succeeded,
+         Queued,
+         Executed,
+-        Expired
++        Expired,
++        Canceled // annulée par le veto du multisig pendant le timelock
+     }
+ 
+     struct Proposal {
+@@ -52,20 +59,25 @@ contract CrowdfundDAO is ReentrancyGuard {
+         uint64 eta; // date d'exécution possible (timelock) ; 0 si non mis en file
+         bool queued;
+         bool executed;
+-        uint256 forVotes; // poids quadratique
++        bool canceled;
++        uint256 forVotes; // poids linéaire (solde de CFD, 18 décimales)
+         uint256 againstVotes;
+         uint256 voters; // nombre de votants distincts
+         string description;
+     }
+ 
+     uint256 public constant GRACE_PERIOD = 7 days;
++    uint256 public constant BPS = 10_000;
+ 
+     CFDToken public immutable token;
+     ICrowdfundingCore public immutable core;
+     uint256 public immutable votingPeriod;
+     uint256 public immutable timelockDelay;
+     uint256 public immutable proposalThreshold; // en CFD (18 décimales)
+-    uint256 public immutable quorumVoters; // nombre minimal de votants distincts
++    uint256 public immutable quorumBps; // quorum sur les votes POUR, en points de base de l'offre au snapshot (1000 = 10 %)
++    uint256 public immutable minQuorum; // plancher absolu du quorum, en CFD (18 décimales)
++    uint256 public immutable snapshotLookback; // nombre de blocs entre le snapshot et la création de la proposition (>= 1)
++    address public immutable guardian; // multisig autorisé à opposer son veto pendant le timelock
+ 
+     Proposal[] private _proposals;
+     mapping(uint256 => mapping(address => bool)) public hasVoted;
+@@ -83,6 +95,7 @@ contract CrowdfundDAO is ReentrancyGuard {
+     error WrongState(ProposalState current);
+     error TimelockNotElapsed(uint64 eta);
+     error InvalidAction();
++    error NotGuardian();
+ 
+     event ProposalCreated(
+         uint256 indexed id,
+@@ -96,6 +109,7 @@ contract CrowdfundDAO is ReentrancyGuard {
+     event VoteCast(uint256 indexed id, address indexed voter, bool support, uint256 weight, uint256 rawBalance);
+     event ProposalQueued(uint256 indexed id, uint64 eta);
+     event ProposalExecuted(uint256 indexed id);
++    event ProposalCanceled(uint256 indexed id, address indexed guardian, string reason);
+ 
+     constructor(
+         CFDToken token_,
+@@ -103,16 +117,23 @@ contract CrowdfundDAO is ReentrancyGuard {
+         uint256 votingPeriod_,
+         uint256 timelockDelay_,
+         uint256 proposalThreshold_,
+-        uint256 quorumVoters_
++        uint256 quorumBps_,
++        uint256 minQuorum_,
++        uint256 snapshotLookback_,
++        address guardian_
+     ) {
+         require(address(token_) != address(0) && address(core_) != address(0), "zero address");
+-        require(votingPeriod_ > 0 && quorumVoters_ > 0, "bad params");
++        require(guardian_ != address(0), "zero address");
++        require(votingPeriod_ > 0 && quorumBps_ > 0 && quorumBps_ <= BPS && snapshotLookback_ >= 1, "bad params");
+         token = token_;
+         core = core_;
+         votingPeriod = votingPeriod_;
+         timelockDelay = timelockDelay_;
+         proposalThreshold = proposalThreshold_;
+-        quorumVoters = quorumVoters_;
++        quorumBps = quorumBps_;
++        minQuorum = minQuorum_;
++        snapshotLookback = snapshotLookback_;
++        guardian = guardian_;
+     }
+ 
+     // =====================================================================
+@@ -127,7 +148,7 @@ contract CrowdfundDAO is ReentrancyGuard {
+         uint256 len = bytes(description).length;
+         if (len == 0 || len > 500) revert InvalidDescription();
+ 
+-        uint256 snapshot = block.number - 1;
++        uint256 snapshot = block.number > snapshotLookback ? block.number - snapshotLookback : 0;
+         uint256 power = token.getPastVotes(msg.sender, snapshot);
+         if (power < proposalThreshold) revert BelowThreshold(power, proposalThreshold);
+ 
+@@ -148,6 +169,7 @@ contract CrowdfundDAO is ReentrancyGuard {
+                 eta: 0,
+                 queued: false,
+                 executed: false,
++                canceled: false,
+                 forVotes: 0,
+                 againstVotes: 0,
+                 voters: 0,
+@@ -158,7 +180,7 @@ contract CrowdfundDAO is ReentrancyGuard {
+     }
+ 
+     // =====================================================================
+-    //  Vote quadratique pondéré par snapshot
++    //  Vote linéaire pondéré par snapshot
+     // =====================================================================
+ 
+     function castVote(uint256 id, bool support) external {
+@@ -167,7 +189,7 @@ contract CrowdfundDAO is ReentrancyGuard {
+         if (hasVoted[id][msg.sender]) revert AlreadyVoted();
+ 
+         uint256 balance = token.getPastVotes(msg.sender, p.snapshotBlock);
+-        uint256 weight = Math.sqrt(balance / 1e18); // CFD entiers -> poids quadratique
++        uint256 weight = balance; // vote linéaire exact : 1 CFD = 1 voix (aucun arrondi)
+         if (weight == 0) revert NoVotingPower();
+ 
+         hasVoted[id][msg.sender] = true;
+@@ -178,11 +200,11 @@ contract CrowdfundDAO is ReentrancyGuard {
+         emit VoteCast(id, msg.sender, support, weight, balance);
+     }
+ 
+-    /// @notice Poids de vote quadratique d'un compte pour la proposition `id` (lecture front-end).
++    /// @notice Poids de vote linéaire d'un compte pour la proposition `id` (lecture front-end).
+     function votingWeight(uint256 id, address account) external view returns (uint256 weight, uint256 rawBalance) {
+         Proposal storage p = _get(id);
+         rawBalance = token.getPastVotes(account, p.snapshotBlock);
+-        weight = Math.sqrt(rawBalance / 1e18);
++        weight = rawBalance;
+     }
+ 
+     // =====================================================================
+@@ -203,6 +225,18 @@ contract CrowdfundDAO is ReentrancyGuard {
+         emit ProposalQueued(id, p.eta);
+     }
+ 
++    /// @notice VETO : le multisig (guardian) annule une proposition en file d'attente (timelock).
++    ///         Il ne peut qu'annuler : aucune approbation ni exécution n'est possible par cette voie.
++    function cancel(uint256 id, string calldata reason) external {
++        if (msg.sender != guardian) revert NotGuardian();
++        ProposalState s = state(id);
++        if (s != ProposalState.Queued) revert WrongState(s);
++        Proposal storage p = _proposals[id];
++        p.canceled = true;
++        openProposal[keccak256(abi.encode(p.kind, p.campaignId))] = false;
++        emit ProposalCanceled(id, msg.sender, reason); // motif public : transparence du veto
++    }
++
+     /// @notice Exécute la proposition une fois le timelock écoulé (et avant expiration).
+     function execute(uint256 id) external nonReentrant {
+         _execute(id);
+@@ -280,12 +314,15 @@ contract CrowdfundDAO is ReentrancyGuard {
+     function state(uint256 id) public view returns (ProposalState) {
+         Proposal storage p = _get(id);
+         if (p.executed) return ProposalState.Executed;
++        if (p.canceled) return ProposalState.Canceled;
+         if (p.queued) {
+             if (block.timestamp > p.eta + GRACE_PERIOD) return ProposalState.Expired;
+             return ProposalState.Queued;
+         }
+         if (block.timestamp < p.voteEnd) return ProposalState.Active;
+-        bool quorumReached = p.voters >= quorumVoters;
++        // Quorum sur les votes POUR : forVotes >= quorumBps % de l'offre de CFD au snapshot ET >= minQuorum (plancher absolu).
++        uint256 supply = token.getPastTotalSupply(p.snapshotBlock);
++        bool quorumReached = p.forVotes * BPS >= supply * quorumBps && p.forVotes >= minQuorum;
+         if (!quorumReached || p.forVotes <= p.againstVotes) return ProposalState.Defeated;
+         return ProposalState.Succeeded;
+     }
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 7dbdea5..f460b67 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -16,7 +16,7 @@
+ |---|---|---|
+ | M1 | `CFDToken.sol` | ERC-20 « CFD » + ERC20Votes/Permit. Seul `MINTER_ROLE` (le Core) peut frapper, déverrouiller, brûler. |
+ | M2 | `CrowdfundingCore.sol` | Campagnes, contributions, statuts, remboursement, retraits par tranches, frais, pause. |
+-| M3 | `CrowdfundDAO.sol` | Propositions (valider tranche / geler), vote quadratique sur snapshot, quorum, timelock. |
++| M3 | `CrowdfundDAO.sol` | Propositions (valider tranche / geler), vote linéaire sur snapshot, quorum sur les votes « pour », timelock, veto du multisig. |
+ | — | `MultiSigTreasury.sol` | Trésorerie 2-sur-3 recevant les frais. |
+ | M4 | `frontend/` | Liste/filtre/pagination des campagnes, détail, contribution, création (IPFS), tableau de vote, compte. |
+ | Bonus | `analysis/fraud_detector.py` | Heuristiques H1–H6, score 0–100, rapport CSV/JSON → badge dans la dApp. |
+@@ -31,18 +31,18 @@
+ **Tranches.** Le total levé est divisé en N tranches (1–5) ; la dernière absorbe le reste de la division (aucun wei perdu, testé). Le bénéficiaire ne peut retirer que les tranches validées par la DAO (`withdrawFunds`). Une campagne gelée après un retrait partiel rembourse **au prorata de ce qui reste** (`contribution × (levé − retiré) / levé`).
+ 
+ **Gouvernance.**
+-- *Pouvoir de vote* = `floor(√(CFD entiers au snapshot))`. Snapshot = bloc précédant la création de la proposition (`getPastVotes`), pas le bloc du vote.
+-- *Majorité* : pour > contre (simple). *Quorum* : nombre minimal de **votants distincts** (2 en local, 5 sur testnet) — choisi en nombre de votants plutôt qu'en part de l'offre car le poids quadratique n'est pas additif sur la masse de jetons.
+-- *Timelock* : `queue` puis attente `timelockDelay` avant `execute` ; expiration après 7 jours (`GRACE_PERIOD`). Exécution déclenchable par n'importe qui (« exécution automatique » sans administrateur).
++- *Pouvoir de vote* = `floor(CFD entiers au snapshot)` (vote linéaire : 1 CFD = 1 voix). Snapshot = bloc précédant la création de la proposition (`getPastVotes`), pas le bloc du vote.
++- *Majorité* : pour > contre (simple). *Quorum* : les votes **« pour »** doivent représenter au moins `quorumBps` de l'offre de CFD au snapshot (1000 = 10 %) **et** au moins `minQuorum` CFD (plancher absolu contre les attaques au démarrage, quand l'offre est minuscule). *Maturité du snapshot* : le snapshot est pris `snapshotLookback` blocs avant la proposition (contribuer puis proposer aussitôt ne donne aucun poids). Les jetons étant verrouillés et proportionnels aux ETH engagés, fractionner ses fonds sur plusieurs adresses ne donne aucun avantage (anti-Sybil) et un attaquant minoritaire seul ne peut pas atteindre le quorum.
++- *Timelock* : `queue` puis attente `timelockDelay` avant `execute` ; expiration après 7 jours (`GRACE_PERIOD`). *Veto* : pendant le timelock, le `guardian` (= le multisig 2-sur-3) peut annuler une proposition adoptée via `cancel(id)` ; il ne peut qu'annuler (jamais approuver ni exécuter) et l'annulation est publique (`ProposalCanceled`). Exécution déclenchable par n'importe qui (« exécution automatique » sans administrateur).
+ - *Anti-spam* : seuil de CFD pour proposer, une proposition ouverte par (type, campagne), description ≤ 500 caractères.
+ 
+-**Pourquoi pas OpenZeppelin Governor ?** Governor est un excellent standard, mais la DAO ici doit appeler un Core précis, avec un vote quadratique et des règles spécifiques ; l'écrire à la main permet de la comprendre et de la défendre en soutenance. Migrer vers Governor + `GovernorVotesQuorumFraction` + `TimelockController` est la suite logique en production.
++**Pourquoi pas OpenZeppelin Governor ?** Governor est un excellent standard, mais la DAO ici doit appeler un Core précis, avec un vote linéaire, un quorum sur les votes « pour » et un veto du multisig ; l'écrire à la main permet de la comprendre et de la défendre en soutenance. Migrer vers Governor + `GovernorVotesQuorumFraction` + `TimelockController` est la suite logique en production.
+ 
+ **Pourquoi Hardhat ?** JavaScript/Ethers.js identique à la dApp, plugins (toolbox, network-helpers `time`/`mine` indispensables pour tester le snapshot et le timelock), nœud local avec 20 comptes, intégration Slither.
+ 
+ ## 4. Limites connues (assumées)
+-1. **Sybil** : le vote quadratique favorise le fractionnement des fonds sur plusieurs adresses. Atténuations : contribution minimale, jetons verrouillés, quorum en nombre de votants, détection hors-chaîne (H3). Une vraie protection exige une preuve d'identité.
+-2. **Droits d'administration** : le déployeur garde `DEFAULT_ADMIN_ROLE` sur le jeton et le Core (il peut accorder `MINTER_ROLE`/`GOVERNANCE_ROLE`). En production : transférer ce rôle à un multisig/timelock puis le retirer au déployeur.
++1. **Pouvoir des gros détenteurs** : le vote est linéaire, donc un contributeur détenant plus de `quorumBps` de l'offre pèse lourd. Le fractionnement en adresses multiples n'apporte plus d'avantage (Sybil neutralisé) ; atténuations : quorum sur les votes « pour », timelock, veto du multisig, détection hors-chaîne (H3).
++2. **Droits d'administration** : `deploy.js` transfère `DEFAULT_ADMIN_ROLE` (jeton et Core) au multisig puis le retire au déployeur (sauf `KEEP_ADMIN=1`) ; hors local, il refuse un multisig plus faible que 2-sur-3 (sauf `ALLOW_WEAK_MULTISIG=1`).
+ 3. **Vote global** : tous les détenteurs de CFD votent sur toutes les campagnes (pas seulement les contributeurs de la campagne concernée).
+ 4. **Multisig** : la trésorerie ne contient que les frais ; un envoi simple ≤ 0,1 ETH (`smallLimit`) n'exige qu'1 signature, au-delà (ou tout appel de contrat) il en faut 2 sur 3. Interface : page *Trésorerie* de la dApp (`#/treasury`).
+ 5. **Pause** : le circuit breaker suspend aussi `refund` (compromis assumé : arrêt total en cas d'incident ; la reprise doit être rapide).
+diff --git a/docs/GUIDE_METAMASK_OPENZEPPELIN.md b/docs/GUIDE_METAMASK_OPENZEPPELIN.md
+index 0f057f6..4e1816f 100644
+--- a/docs/GUIDE_METAMASK_OPENZEPPELIN.md
++++ b/docs/GUIDE_METAMASK_OPENZEPPELIN.md
+@@ -30,7 +30,6 @@ Installation : `npm install @openzeppelin/contracts` (déjà fait). Contrats uti
+ | `AccessControl` | rôles `MINTER_ROLE`, `PAUSER_ROLE`, `GOVERNANCE_ROLE`, admin |
+ | `ReentrancyGuard` | `nonReentrant` sur contribute / refund / withdrawFunds / claimTokens / sweepFees / execute |
+ | `Pausable` | circuit breaker |
+-| `Math.sqrt` | poids de vote quadratique |
+ 
+ Pour partir de **OpenZeppelin Wizard** (https://wizard.openzeppelin.com) : choisir *ERC20* → cocher *Mintable, Votes, Permit, Access Control (Roles)* → copier le code, comparer avec `contracts/CFDToken.sol`. Le Wizard n'est qu'un point de départ : la logique de verrouillage et de mint par le Core est propre à ce projet.
+ 
+diff --git a/docs/GUIDE_SEPOLIA.md b/docs/GUIDE_SEPOLIA.md
+index 72920c2..150143c 100644
+--- a/docs/GUIDE_SEPOLIA.md
++++ b/docs/GUIDE_SEPOLIA.md
+@@ -16,7 +16,7 @@ MULTISIG_OWNERS=0xAdresse1,0xAdresse2,0xAdresse3
+ # Optionnel : vérifier le code sur Etherscan
+ ETHERSCAN_API_KEY=VOTRE_CLE_ETHERSCAN
+ ```
+-Paramètres par défaut hors local : vote 3 jours, timelock 1 jour, seuil de proposition 100 CFD, quorum 5 votants, multisig 2 sur 3, seuil d'1 signature jusqu'à 0,1 ETH. Pour une démo plus rapide : `VOTING_PERIOD=600`, `TIMELOCK_DELAY=120`, `PROPOSAL_THRESHOLD_CFD=10`, `QUORUM_VOTERS=2` dans le `.env`.
++Paramètres par défaut hors local : vote 3 jours, timelock 48 h, seuil de proposition 100 CFD, quorum 10 % de l'offre (votes « pour »), veto du multisig, multisig 2 sur 3, seuil d'1 signature jusqu'à 0,1 ETH. Pour une démo plus rapide : `VOTING_PERIOD=600`, `TIMELOCK_DELAY=120`, `PROPOSAL_THRESHOLD_CFD=10`, `QUORUM_BPS=1000` dans le `.env`.
+ 
+ ## 3. Déployer (PowerShell)
+ ```powershell
+diff --git a/docs/SECURITE.md b/docs/SECURITE.md
+index e4bbb54..26b44ee 100644
+--- a/docs/SECURITE.md
++++ b/docs/SECURITE.md
+@@ -7,8 +7,8 @@
+ | 3 | **Circuit breaker** | `Pausable` : `pause()`/`unpause()` par `PAUSER_ROLE` ; bloque création, contribution, remboursement, retrait, frais, jetons. | `circuit breaker : pause bloque…` |
+ | 4 | **Multisignature 2-sur-3** | `MultiSigTreasury` : submit → confirm → execute, revoke, anti double exécution ; seuil `smallLimit` (envoi simple ≤ seuil : 1 signature ; au-delà ou appel de contrat : `required`, ex. 2 sur 3). Reçoit les frais (`sweepFees`). | `exige 2 confirmations sur 3` |
+ | 5 | **Gouvernance : prise de contrôle éclair / flash loan** | Snapshot via `ERC20Votes.getPastVotes(bloc de création − 1)` ; jetons verrouillés (non transférables) ; seuil pour proposer évalué au snapshot. | `snapshot : … n'ont aucun poids` |
+-| 6 | **Baleines** | Vote quadratique (√ solde) | `poids = racine carrée…` |
+-| 7 | **Exécution précipitée** | Timelock + quorum + expiration ; une proposition ouverte par (type, campagne) | `quorum, timelock, anti-spam` |
++| 6 | **Sybil / minorité** | Vote linéaire (1 CFD = 1 voix) sur jetons verrouillés + quorum sur les votes « pour » (10 % de l'offre au snapshot) | `anti-Sybil…`, `quorum sur les votes POUR` |
++| 7 | **Exécution précipitée / décision malveillante adoptée** | Timelock + expiration ; une proposition ouverte par (type, campagne) ; **veto du multisig 2-sur-3** (`cancel`) pendant le timelock | `quorum, timelock, anti-spam`, `veto du multisig` |
+ | 8 | **Rug pull** | Déblocage par tranches validées par la DAO ; gel + remboursement au prorata | `gel d'une campagne frauduleuse` |
+ | 9 | **Wash funding** | Le créateur/bénéficiaire ne peut pas contribuer à sa campagne ; contribution minimale | `refuse … auto-financement` |
+ | 10 | **Dépassements / arrondis** | Solidity ≥ 0.8 (checked math) ; dernière tranche absorbe le reste | `la somme des tranches == fonds levés` |
+diff --git a/frontend/app.js b/frontend/app.js
+index 40bf6d7..aa10ad1 100644
+--- a/frontend/app.js
++++ b/frontend/app.js
+@@ -22,7 +22,7 @@ const S = {
+ };
+ const STATUS = ["Active", "Successful", "Failed", "Canceled"];
+ const STATUS_FR = ["En cours", "Réussie", "Échouée", "Annulée / gelée"];
+-const PSTATE_FR = ["En attente", "Vote en cours", "Rejetée", "Adoptée", "En timelock", "Exécutée", "Expirée"];
++const PSTATE_FR = ["En attente", "Vote en cours", "Rejetée", "Adoptée", "En timelock", "Exécutée", "Expirée", "Annulée (veto)"];
+ const PAGE_SIZE = 9;
+ const CATS = ["Éducation", "Technologie", "Environnement", "Santé", "Art & culture", "Communauté", "Finance"];
+ 
+@@ -270,7 +270,7 @@ function trancheRows(c) {
+ const tile = (label, value, sub = "") => `<div class="tile"><small>${label}</small><b>${value}</b>${sub ? `<em>${sub}</em>` : ""}</div>`;
+ function propCard(i, p, s) {
+   const f = Number(p.forVotes), a = Number(p.againstVotes), tot = f + a || 1;
+-  const cls = s === 5 ? "ok" : s === 2 || s === 6 ? "bad" : s === 1 ? "warn" : "";
++  const cls = s === 5 ? "ok" : s === 2 || s === 6 || s === 7 ? "bad" : s === 1 ? "warn" : "";
+   return `<div class="panel prop2">
+     <div class="row"><div><span class="muted small">Proposition n°${i}</span><div class="prop-title">${p.kind === 0n ? "✔ Valider une tranche" : "❄ Geler la campagne"}</div></div>
+       <span class="pill ${cls}">${PSTATE_FR[s]}</span></div>
+@@ -318,7 +318,7 @@ async function viewHome() {
+       <div class="stat"><b>${all.length}</b><span>campagnes</span></div>
+       <div class="stat"><b>${active}</b><span>en cours</span></div>
+       <div class="stat"><b>${eth(totalRaised, 2)} ETH</b><span>levés au total</span></div>
+-      <div class="stat"><b>${S.cfg.params.quorumVoters}</b><span>votants min. (quorum DAO)</span></div>
++      <div class="stat"><b>${S.cfg.params.quorumPercent} %</b><span>quorum DAO (votes « pour »)</span></div>
+     </div>
+   </section>
+   <div class="layout">
+@@ -628,11 +628,11 @@ async function viewDao() {
+     <div class="panel"><b>${P.proposalThresholdCFD} CFD</b><div class="muted small">pour proposer</div></div>
+     <div class="panel"><b>${dur(P.votingPeriod)}</b><div class="muted small">période de vote</div></div>
+     <div class="panel"><b>${dur(P.timelockDelay)}</b><div class="muted small">timelock avant exécution</div></div>
+-    <div class="panel"><b>${P.quorumVoters} votants</b><div class="muted small">quorum minimal</div></div>
++    <div class="panel"><b>${P.quorumPercent} %</b><div class="muted small">quorum (votes « pour », min. ${P.minQuorumCFD} CFD)</div></div>
+     <div class="panel"><b>${eth(treasuryBal, 3)} ETH</b><div class="muted small">trésorerie multisig (+ ${eth(fees, 3)} à transférer)</div></div>
+   </div>
+   ${paused ? `<div class="alert bad">⏸ Plateforme en pause (circuit breaker).</div>` : ""}
+-  <div class="alert info small"><b>Comment votez-vous ?</b> Poids = √(CFD détenus au <i>snapshot</i>) — vote quadratique : 4× plus de jetons = 2× plus de voix. Les jetons acquis après la création de la proposition ne comptent pas (anti flash-loan).
++  <div class="alert info small"><b>Comment votez-vous ?</b> Poids = CFD détenus au <i>snapshot</i> (1 CFD = 1 voix) — fractionner ses fonds sur plusieurs adresses ne donne aucun avantage. Le quorum se compte sur les votes « pour ». Le multisig peut opposer son veto pendant le timelock. Les jetons acquis après la création de la proposition ne comptent pas (anti flash-loan).
+   ${S.fraud && Object.keys(S.fraud).length ? "" : ""}</div>
+   ${items.length ? items.map(propHtml).join("") : `<div class="panel">Aucune proposition. Ouvrez une campagne pour en créer une.</div>`}
+   ${S.cfg.addresses.treasury ? `<p class="muted small">Contrats : DAO <span class="mono">${esc(S.cfg.addresses.dao)}</span> · Core <span class="mono">${esc(S.cfg.addresses.core)}</span> · CFD <span class="mono">${esc(S.cfg.addresses.token)}</span></p>` : ""}
+@@ -646,16 +646,16 @@ function propHtml({ i, p, s, w, voted, meta }) {
+   const f = Number(p.forVotes), a = Number(p.againstVotes), tot = f + a || 1;
+   const end = Number(p.voteEnd), eta = Number(p.eta);
+   const act = [];
+-  if (s === 1 && !voted && w[0] > 0n) act.push(`<button data-act="yes" data-i="${i}" class="primary">Pour (poids ${w[0]})</button><button data-act="no" data-i="${i}">Contre</button>`);
++  if (s === 1 && !voted && w[0] > 0n) act.push(`<button data-act="yes" data-i="${i}" class="primary">Pour (poids ${cfd(w[0])})</button><button data-act="no" data-i="${i}">Contre</button>`);
+   if (s === 1 && voted) act.push(`<span class="pill ok">Vous avez voté</span>`);
+   if (s === 1 && !voted && w[0] === 0n && S.account) act.push(`<span class="muted small">Pas de pouvoir de vote au snapshot.</span>`);
+   if (s === 3) act.push(`<span class="pill warn">Adoptée : mise en file en cours…</span>`);
+   if (s === 4) act.push(eta <= S.now ? `<span class="pill warn">Timelock écoulé : exécution en cours…</span>` : `<span class="pill warn">Timelock : ${dur(eta - S.now)}</span>`);
+   return `<div class="panel prop">
+-    <div class="row"><b>#${i} · ${p.kind === 0n ? "✔ Valider une tranche" : "❄ Geler la campagne"} — <a href="#/campaign/${p.campaignId}">${esc(meta.title)}</a></b><span class="pill ${s === 5 ? "ok" : s === 2 || s === 6 ? "bad" : ""}">${PSTATE_FR[s]}</span></div>
++    <div class="row"><b>#${i} · ${p.kind === 0n ? "✔ Valider une tranche" : "❄ Geler la campagne"} — <a href="#/campaign/${p.campaignId}">${esc(meta.title)}</a></b><span class="pill ${s === 5 ? "ok" : s === 2 || s === 6 || s === 7 ? "bad" : ""}">${PSTATE_FR[s]}</span></div>
+     <p class="muted">${esc(p.description)}</p>
+-    <div class="vote" aria-label="Pour ${f}, contre ${a}"><div class="y" style="width:${(f / tot) * 100}%"></div><div class="n" style="width:${(a / tot) * 100}%"></div></div>
+-    <div class="row muted small"><span>Pour ${f} · Contre ${a}</span><span>${p.voters} votant(s) / quorum ${S.cfg.params.quorumVoters}</span><span>${s === 1 ? "fin du vote dans " + dur(end - S.now) : "snapshot bloc " + p.snapshotBlock}</span></div>
++    <div class="vote" aria-label="Pour ${cfd(p.forVotes)}, contre ${cfd(p.againstVotes)}"><div class="y" style="width:${(f / tot) * 100}%"></div><div class="n" style="width:${(a / tot) * 100}%"></div></div>
++    <div class="row muted small"><span>Pour ${cfd(p.forVotes)} · Contre ${cfd(p.againstVotes)}</span><span>${p.voters} votant(s) · quorum ${S.cfg.params.quorumPercent} % de l'offre en « pour »</span><span>${s === 1 ? "fin du vote dans " + dur(end - S.now) : "snapshot bloc " + p.snapshotBlock}</span></div>
+     <div class="actions">${act.join("")}</div></div>`;
+ }
+ 
+diff --git a/scripts/deploy.js b/scripts/deploy.js
+index d6a5cf1..a6b2f2b 100644
+--- a/scripts/deploy.js
++++ b/scripts/deploy.js
+@@ -12,15 +12,23 @@ async function main() {
+ 
+   // Paramètres de gouvernance : courts en local (démo), réalistes sur testnet.
+   const votingPeriod = Number(process.env.VOTING_PERIOD || (isLocal ? 300 : 3 * 24 * 3600));
+-  const timelockDelay = Number(process.env.TIMELOCK_DELAY || (isLocal ? 60 : 24 * 3600));
++  const timelockDelay = Number(process.env.TIMELOCK_DELAY || (isLocal ? 60 : 48 * 3600));
+   const threshold = ethers.parseEther(process.env.PROPOSAL_THRESHOLD_CFD || (isLocal ? "10" : "100"));
+-  const quorumVoters = Number(process.env.QUORUM_VOTERS || (isLocal ? 2 : 5));
++  // Quorum sur les votes POUR, en points de base de l'offre au snapshot (1000 = 10 %).
++  const quorumBps = Number(process.env.QUORUM_BPS || 1000);
++  // Plancher absolu du quorum (CFD) : évite qu'un attaquant atteigne 10 % quand l'offre est encore minuscule.
++  const minQuorum = ethers.parseEther(process.env.MIN_QUORUM_CFD || (isLocal ? "100" : "1000"));
++  // Maturité du snapshot (blocs) : 7200 blocs ≈ 24 h sur Ethereum ; 1 en local. Réduire pour une démo Sepolia.
++  const snapshotLookback = Number(process.env.SNAPSHOT_LOOKBACK || (isLocal ? 1 : 7200));
+ 
+   // Propriétaires du multisig : en local 3 comptes de test ; sinon MULTISIG_OWNERS="0x..,0x..,0x.." (2 sur 3).
+   const owners = process.env.MULTISIG_OWNERS
+     ? process.env.MULTISIG_OWNERS.split(",").map((s) => s.trim())
+     : isLocal ? [signers[17].address, signers[18].address, signers[19].address] : [deployer.address];
+   const required = Number(process.env.MULTISIG_REQUIRED || (owners.length >= 3 ? 2 : 1));
++  // Garde-fou : hors local, le multisig doit être un vrai 2-sur-3 (sinon le veto et l'administration dépendent d'une seule personne).
++  if (!isLocal && !process.env.ALLOW_WEAK_MULTISIG && (new Set(owners.map((o) => o.toLowerCase())).size < 3 || required < 2))
++    throw new Error("Multisig faible : fournissez MULTISIG_OWNERS=\"0x..,0x..,0x..\" (3 adresses distinctes, 2 signatures) ou ALLOW_WEAK_MULTISIG=1 pour une démo.");
+   // Seuil du multisig : au-dessus (ou pour un appel de contrat) -> `required` signatures obligatoires.
+   const smallLimit = ethers.parseEther(process.env.MULTISIG_SMALL_LIMIT_ETH || "0.1");
+ 
+@@ -52,13 +60,25 @@ async function main() {
+     await core.waitForDeployment();
+   }
+   const dao = await (await ethers.getContractFactory("CrowdfundDAO")).deploy(
+-    await token.getAddress(), await core.getAddress(), votingPeriod, timelockDelay, threshold, quorumVoters);
++    await token.getAddress(), await core.getAddress(), votingPeriod, timelockDelay, threshold, quorumBps, minQuorum, snapshotLookback, await treasury.getAddress()); // guardian = multisig (veto)
+   await dao.waitForDeployment();
+ 
+   // Câblage des rôles (principe du moindre privilège)
+   await (await token.grantRole(await token.MINTER_ROLE(), await core.getAddress())).wait();
+   await (await core.grantRole(await core.GOVERNANCE_ROLE(), await dao.getAddress())).wait();
+ 
++  // Droits d'administration : transférés au multisig puis retirés au déployeur (sinon un seul compte pourrait
++  // s'accorder MINTER/GOVERNANCE et contourner la DAO). PAUSER_ROLE reste au déployeur (réaction rapide).
++  if (process.env.KEEP_ADMIN !== "1") {
++    const ADMIN = await token.DEFAULT_ADMIN_ROLE();
++    const ms = await treasury.getAddress();
++    for (const c of [token, core]) {
++      await (await c.grantRole(ADMIN, ms)).wait();
++      await (await c.renounceRole(ADMIN, deployer.address)).wait();
++    }
++    console.log("DEFAULT_ADMIN_ROLE transféré au multisig et retiré au déployeur.");
++  }
++
+   const net = await ethers.provider.getNetwork();
+   const out = {
+     network: network.name,
+@@ -66,7 +86,7 @@ async function main() {
+     // URL publique pour la dApp (ne JAMAIS y mettre la clé Infura/Alchemy privée du .env)
+     rpcUrl: isLocal ? "http://127.0.0.1:8545" : (process.env.PUBLIC_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com"),
+     deployedAtBlock: await ethers.provider.getBlockNumber(),
+-    params: { votingPeriod, timelockDelay, proposalThresholdCFD: ethers.formatEther(threshold), quorumVoters, multisigRequired: required, multisigSmallLimitETH: ethers.formatEther(smallLimit) },
++    params: { votingPeriod, timelockDelay, proposalThresholdCFD: ethers.formatEther(threshold), quorumBps, quorumPercent: quorumBps / 100, minQuorumCFD: ethers.formatEther(minQuorum), snapshotLookback, multisigRequired: required, multisigSmallLimitETH: ethers.formatEther(smallLimit) },
+     addresses: {
+       token: await token.getAddress(), core: await core.getAddress(),
+       dao: await dao.getAddress(), treasury: await treasury.getAddress(),
+diff --git a/test/DAO.test.js b/test/DAO.test.js
+index 6620fb4..2f33e72 100644
+--- a/test/DAO.test.js
++++ b/test/DAO.test.js
+@@ -1,7 +1,7 @@
+ const { expect } = require("chai");
+ const { ethers } = require("hardhat");
+ const { mine } = require("@nomicfoundation/hardhat-network-helpers");
+-const { deployAll, createCampaign, time, DAY, VOTING_PERIOD, TIMELOCK } = require("./helpers");
++const { deployAll, createCampaign, time, DAY, VOTING_PERIOD, TIMELOCK, THRESHOLD, QUORUM_BPS } = require("./helpers");
+ 
+ async function setup() {
+   const ctx = await deployAll();
+@@ -73,22 +73,43 @@ describe("CrowdfundDAO (M3 - Gouvernance)", () => {
+     expect(await token.balanceOf(bob.address)).to.equal(ethers.parseEther("1100"));
+   });
+ 
+-  describe("vote quadratique", () => {
+-    it("poids = racine carrée du solde : une baleine n'écrase pas les petits porteurs", async () => {
+-      const { core, dao, id, creator, beneficiary, alice, bob, carol, dave, whale } = await deployAll().then(async (c) => ({
++  describe("vote linéaire (1 CFD = 1 voix)", () => {
++    it("poids = solde de CFD au snapshot", async () => {
++      const { dao, id, alice, bob } = await setup();
++      await dao.connect(alice).propose(0, id, "x");
++      await dao.connect(alice).castVote(0, true); // 2000 CFD
++      await dao.connect(bob).castVote(0, false); //  1000 CFD
++      const p = await dao.getProposal(0);
++      expect(p.forVotes).to.equal(ethers.parseEther("2000"));
++      expect(p.againstVotes).to.equal(ethers.parseEther("1000"));
++    });
++
++    it("aucun arrondi : un solde de 1,5 CFD compte pour 1,5 voix", async () => {
++      const { core, dao, id, alice, whale } = await setup();
++      await core.connect(whale).contribute(id, { value: ethers.parseEther("0.0015") }); // 1,5 CFD, AVANT la proposition
++      await dao.connect(alice).propose(0, id, "x");
++      const [w, raw] = await dao.votingWeight(0, whale.address);
++      expect(w).to.equal(ethers.parseEther("1.5"));
++      expect(raw).to.equal(w);
++      await dao.connect(whale).castVote(0, true);
++      expect((await dao.getProposal(0)).forVotes).to.equal(ethers.parseEther("1.5"));
++    });
++
++    it("anti-Sybil : 4 adresses à 1 ETH pèsent exactement comme 1 adresse à 4 ETH", async () => {
++      const { core, dao, id, alice, bob, carol, dave, whale } = await deployAll().then(async (c) => ({
+         ...c,
+         id: await createCampaign(c.core, c.creator, c.beneficiary, { goal: "100" }),
+       }));
+-      await core.connect(whale).contribute(id, { value: ethers.parseEther("16") }); // 16000 CFD -> poids 126
+-      for (const u of [alice, bob, carol, dave]) await core.connect(u).contribute(id, { value: ethers.parseEther("4") }); // 4000 -> 63
++      await core.connect(whale).contribute(id, { value: ethers.parseEther("4") }); // 1 adresse : 4000 CFD
++      for (const u of [alice, bob, carol, dave]) await core.connect(u).contribute(id, { value: ethers.parseEther("1") }); // 4 adresses : 1000 CFD chacune
+       await dao.connect(alice).propose(0, id, "x");
+       await dao.connect(whale).castVote(0, false);
+-      for (const u of [alice, bob, carol]) await dao.connect(u).castVote(0, true);
++      for (const u of [alice, bob, carol, dave]) await dao.connect(u).castVote(0, true);
+       const p = await dao.getProposal(0);
+-      expect(p.againstVotes).to.equal(126n); // sqrt(16000)=126
+-      expect(p.forVotes).to.equal(63n * 3n); // 3 x sqrt(4000)=63
+-      // En vote linéaire : 16000 > 12000 (la baleine gagnerait). En quadratique : 189 > 126.
+-      expect(p.forVotes).to.be.greaterThan(p.againstVotes);
++      expect(p.againstVotes).to.equal(ethers.parseEther("4000"));
++      expect(p.forVotes).to.equal(ethers.parseEther("4000")); // le fractionnement ne donne AUCUN avantage
++      await time.increase(VOTING_PERIOD + 1);
++      expect(await dao.state(0)).to.equal(2n); // Defeated (pour == contre)
+     });
+ 
+     it("un compte sans jeton ne peut pas voter, et on ne vote qu'une fois", async () => {
+@@ -121,11 +142,10 @@ describe("CrowdfundDAO (M3 - Gouvernance)", () => {
+   });
+ 
+   describe("quorum, timelock, anti-spam", () => {
+-    it("rejetée sans quorum (< 3 votants)", async () => {
++    it("rejetée sans quorum : aucun vote POUR (même avec des votes contre)", async () => {
+       const { dao, id, alice, bob } = await setup();
+       await dao.connect(alice).propose(0, id, "x");
+-      await dao.connect(alice).castVote(0, true);
+-      await dao.connect(bob).castVote(0, true);
++      await dao.connect(bob).castVote(0, false); // seulement un vote contre : 0 « pour » < 10 % de l'offre
+       await time.increase(VOTING_PERIOD + 1);
+       expect(await dao.state(0)).to.equal(2n); // Defeated
+       await expect(dao.queue(0)).to.be.revertedWithCustomError(dao, "WrongState");
+@@ -189,6 +209,163 @@ describe("CrowdfundDAO (M3 - Gouvernance)", () => {
+   });
+ });
+ 
++describe("CrowdfundDAO — gouvernance renforcée (anti-Sybil, quorum « pour », veto)", () => {
++  describe("quorum sur les votes POUR (10 % de l'offre au snapshot)", () => {
++    // Offre : alice/bob/carol/dave 20 ETH = 80 000 CFD ; attaquant 4 000 CFD ; testeur 3 000 CFD  => offre 87 000, quorum = 8 700 CFD « pour »
++    async function bigSetup() {
++      const ctx = await deployAll();
++      const { core, creator, beneficiary, alice, bob, carol, dave, whale } = ctx;
++      const id = await createCampaign(core, creator, beneficiary, { goal: "200" });
++      for (const u of [alice, bob, carol, dave]) await core.connect(u).contribute(id, { value: ethers.parseEther("20") });
++      await core.connect(whale).contribute(id, { value: ethers.parseEther("4") });
++      return { ...ctx, id };
++    }
++
++    it("un attaquant minoritaire (4,6 % de l'offre) seul est rejeté faute de quorum", async () => {
++      const { dao, id, whale } = await bigSetup();
++      await dao.connect(whale).propose(0, id, "proposition malveillante");
++      await dao.connect(whale).castVote(0, true); // 4000 « pour », aucun « contre »
++      await time.increase(VOTING_PERIOD + 1);
++      expect(await dao.state(0)).to.equal(2n); // Defeated : 4000 < 8700
++    });
++
++    it("les votes CONTRE ne comptent pas dans le quorum : pour > contre ne suffit pas", async () => {
++      const { core, dao, id, whale, o1 } = await bigSetup();
++      await core.connect(o1).contribute(id, { value: ethers.parseEther("3") }); // 3000 CFD (offre 90 000, quorum 9 000) — après le snapshot : on le fait AVANT la proposition
++      await dao.connect(whale).propose(0, id, "x");
++      await dao.connect(whale).castVote(0, true); // 4000 pour
++      await dao.connect(o1).castVote(0, false); //   3000 contre
++      await time.increase(VOTING_PERIOD + 1);
++      expect(await dao.state(0)).to.equal(2n); // pour (4000) > contre (3000) mais 4000 < 9000
++    });
++
++    it("avec le soutien de vrais contributeurs, le quorum est atteint", async () => {
++      const { dao, id, whale, alice } = await bigSetup();
++      await dao.connect(whale).propose(0, id, "x");
++      await dao.connect(whale).castVote(0, true); //  4000
++      await dao.connect(alice).castVote(0, true); // 20000 -> 24000 >= 8700
++      await time.increase(VOTING_PERIOD + 1);
++      expect(await dao.state(0)).to.equal(3n); // Succeeded
++    });
++
++    it("paramètres invalides refusés à la construction", async () => {
++      const { token, core, treasury } = await deployAll();
++      const DAO = await ethers.getContractFactory("CrowdfundDAO");
++      const [a, b, c] = [await token.getAddress(), await core.getAddress(), await treasury.getAddress()];
++      await expect(DAO.deploy(a, b, VOTING_PERIOD, TIMELOCK, 1n, 0, 0n, 1, c)).to.be.revertedWith("bad params");
++      await expect(DAO.deploy(a, b, VOTING_PERIOD, TIMELOCK, 1n, 10001, 0n, 1, c)).to.be.revertedWith("bad params");
++      await expect(DAO.deploy(a, b, VOTING_PERIOD, TIMELOCK, 1n, 1000, 0n, 1, ethers.ZeroAddress)).to.be.revertedWith("zero address");
++      await expect(DAO.deploy(a, b, VOTING_PERIOD, TIMELOCK, 1n, 1000, 0n, 0, c)).to.be.revertedWith("bad params"); // lookback >= 1
++    });
++  });
++
++  describe("veto du multisig pendant le timelock", () => {
++    async function queued() {
++      const ctx = await setup();
++      const { dao, id, alice, bob, carol } = ctx;
++      await dao.connect(alice).propose(0, id, "x");
++      for (const u of [alice, bob, carol]) await dao.connect(u).castVote(0, true);
++      await time.increase(VOTING_PERIOD + 1);
++      await dao.queue(0);
++      return ctx;
++    }
++    const cancelData = (dao, n) => dao.interface.encodeFunctionData("cancel", [n, "fraude suspectée"]);
++
++    it("le multisig (2 signatures sur 3) annule une proposition en file d'attente", async () => {
++      const { core, dao, treasury, id, o1, o2 } = await queued();
++      const daoAddr = await dao.getAddress();
++      await treasury.connect(o1).submit(daoAddr, 0, cancelData(dao, 0)); // 1 confirmation (auto)
++      await expect(treasury.connect(o1).execute(0)).to.be.revertedWithCustomError(treasury, "NotEnoughConfirmations");
++      await treasury.connect(o2).confirm(0);
++      await expect(treasury.connect(o1).execute(0)).to.emit(dao, "ProposalCanceled").withArgs(0n, await treasury.getAddress(), "fraude suspectée");
++      expect(await dao.state(0)).to.equal(7n); // Canceled
++      await time.increase(TIMELOCK + 1);
++      await expect(dao.execute(0)).to.be.revertedWithCustomError(dao, "WrongState");
++      expect(await core.effectiveStatus(id)).to.equal(0n); // la campagne n'a pas été touchée (Active)
++    });
++
++    it("seul le guardian (multisig) peut annuler", async () => {
++      const { dao, alice } = await queued();
++      await expect(dao.connect(alice).cancel(0, "x")).to.be.revertedWithCustomError(dao, "NotGuardian");
++    });
++
++    it("le veto n'est possible que sur une proposition EN FILE D'ATTENTE", async () => {
++      const { dao, treasury, id, alice, o1, o2 } = await setup().then(async (c) => c);
++      await dao.connect(alice).propose(0, id, "x"); // état Active
++      await treasury.connect(o1).submit(await dao.getAddress(), 0, cancelData(dao, 0));
++      await treasury.connect(o2).confirm(0);
++      await expect(treasury.connect(o1).execute(0)).to.be.revertedWithCustomError(treasury, "CallFailed");
++    });
++
++    it("après un veto, une nouvelle proposition peut être ouverte pour la même campagne", async () => {
++      const { dao, treasury, id, alice, o1, o2 } = await queued();
++      await treasury.connect(o1).submit(await dao.getAddress(), 0, cancelData(dao, 0));
++      await treasury.connect(o2).confirm(0);
++      await treasury.connect(o1).execute(0);
++      await dao.connect(alice).propose(0, id, "nouvelle proposition");
++    });
++  });
++});
++
++describe("CrowdfundDAO — réduction des limites (plancher de quorum, maturité du snapshot, droits d'admin)", () => {
++  async function newDao(ctx, minQuorum, lookback) {
++    const DAO = await ethers.getContractFactory("CrowdfundDAO");
++    return DAO.deploy(await ctx.token.getAddress(), await ctx.core.getAddress(), VOTING_PERIOD, TIMELOCK, THRESHOLD, QUORUM_BPS,
++      minQuorum, lookback, await ctx.treasury.getAddress());
++  }
++
++  it("plancher de quorum : au démarrage (offre minuscule), 10 % seuls ne suffisent plus", async () => {
++    const ctx = await deployAll();
++    const { core, dao, creator, beneficiary, alice, whale } = ctx;
++    const id = await createCampaign(core, creator, beneficiary, { goal: "50" });
++    await core.connect(alice).contribute(id, { value: ethers.parseEther("0.1") }); //  100 CFD
++    await core.connect(whale).contribute(id, { value: ethers.parseEther("0.1") }); //  100 CFD : offre = 200, 10 % = 20 CFD
++    // SANS plancher : l'attaquant (100 CFD « pour ») passe seul
++    await dao.connect(whale).propose(0, id, "attaque au démarrage");
++    await dao.connect(whale).castVote(0, true);
++    await time.increase(VOTING_PERIOD + 1);
++    expect(await dao.state(0)).to.equal(3n); // Succeeded : la faille
++    // AVEC plancher de 1000 CFD : rejeté
++    const safe = await newDao(ctx, ethers.parseEther("1000"), 1);
++    await safe.connect(whale).propose(0, id, "attaque au démarrage");
++    await safe.connect(whale).castVote(0, true);
++    await time.increase(VOTING_PERIOD + 1);
++    expect(await safe.state(0)).to.equal(2n); // Defeated
++  });
++
++  it("maturité du snapshot : contribuer puis proposer aussitôt ne donne aucun pouvoir", async () => {
++    const ctx = await deployAll();
++    const { core, creator, beneficiary, alice } = ctx;
++    const dao = await newDao(ctx, 0n, 10); // snapshot = 10 blocs avant la proposition
++    const id = await createCampaign(core, creator, beneficiary, { goal: "50" });
++    await core.connect(alice).contribute(id, { value: ethers.parseEther("1") });
++    await expect(dao.connect(alice).propose(0, id, "x")).to.be.revertedWithCustomError(dao, "BelowThreshold");
++    await mine(10);
++    await dao.connect(alice).propose(0, id, "x"); // les jetons ont maintenant « mûri »
++    await dao.connect(alice).castVote(0, true);
++  });
++
++  it("droits d'administration : transférés au multisig, le déployeur ne peut plus s'accorder de rôle", async () => {
++    const { admin, token, core, treasury, alice, o1, o2 } = await deployAll();
++    const ADMIN = await token.DEFAULT_ADMIN_ROLE();
++    const ms = await treasury.getAddress();
++    for (const c of [token, core]) { await c.grantRole(ADMIN, ms); await c.renounceRole(ADMIN, admin.address); }
++    expect(await token.hasRole(ADMIN, admin.address)).to.equal(false);
++    expect(await core.hasRole(ADMIN, admin.address)).to.equal(false);
++    expect(await token.hasRole(ADMIN, ms)).to.equal(true);
++    // le déployeur ne peut plus s'attribuer MINTER / GOVERNANCE
++    await expect(token.connect(admin).grantRole(await token.MINTER_ROLE(), alice.address)).to.be.reverted;
++    await expect(core.connect(admin).grantRole(await core.GOVERNANCE_ROLE(), alice.address)).to.be.reverted;
++    // le multisig peut le faire, mais seulement avec 2 signatures
++    const data = token.interface.encodeFunctionData("grantRole", [await token.MINTER_ROLE(), alice.address]);
++    await treasury.connect(o1).submit(await token.getAddress(), 0, data);
++    await expect(treasury.connect(o1).execute(0)).to.be.revertedWithCustomError(treasury, "NotEnoughConfirmations");
++    await treasury.connect(o2).confirm(0);
++    await treasury.connect(o1).execute(0);
++    expect(await token.hasRole(await token.MINTER_ROLE(), alice.address)).to.equal(true);
++  });
++});
++
+ describe("Exécution automatique (keeper : checkUpkeep / performUpkeep)", () => {
+   it("un robot sans privilège fait avancer la proposition adoptée : mise en file puis exécution", async () => {
+     const { core, dao, id, alice, bob, carol, dave } = await setup();
+diff --git a/test/helpers.js b/test/helpers.js
+index d1a31a6..7481d35 100644
+--- a/test/helpers.js
++++ b/test/helpers.js
+@@ -3,9 +3,11 @@ const { time } = require("@nomicfoundation/hardhat-network-helpers");
+ 
+ const DAY = 24 * 3600;
+ const VOTING_PERIOD = 3 * DAY;
+-const TIMELOCK = 1 * DAY;
++const TIMELOCK = 2 * DAY; // 48 h
+ const THRESHOLD = ethers.parseEther("10"); // 10 CFD pour proposer
+-const QUORUM_VOTERS = 3;
++const MIN_QUORUM = 0n; // plancher absolu désactivé par défaut dans les tests (testé à part)
++const LOOKBACK = 1; // snapshot = bloc précédent (testé à part avec une valeur plus grande)
++const QUORUM_BPS = 1000; // quorum : 10 % de l'offre, sur les votes POUR
+ 
+ async function deployAll() {
+   const [admin, creator, beneficiary, alice, bob, carol, dave, whale, o1, o2, o3] = await ethers.getSigners();
+@@ -26,7 +28,10 @@ async function deployAll() {
+     VOTING_PERIOD,
+     TIMELOCK,
+     THRESHOLD,
+-    QUORUM_VOTERS
++    QUORUM_BPS,
++    MIN_QUORUM,
++    LOOKBACK,
++    await treasury.getAddress() // guardian : le multisig 2-sur-3 détient le veto
+   );
+ 
+   await token.grantRole(await token.MINTER_ROLE(), await core.getAddress());
+@@ -40,4 +45,4 @@ async function createCampaign(core, creator, beneficiary, { goal = "10", duratio
+   return (await core.campaignCount()) - 1n;
+ }
+ 
+-module.exports = { deployAll, createCampaign, time, DAY, VOTING_PERIOD, TIMELOCK, THRESHOLD, QUORUM_VOTERS };
++module.exports = { deployAll, createCampaign, time, DAY, VOTING_PERIOD, TIMELOCK, THRESHOLD, QUORUM_BPS, MIN_QUORUM, LOOKBACK };

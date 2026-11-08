@@ -19,8 +19,12 @@ async function main() {
     ["river-cleanup", 5, 14, 2, s[5], s[6]],
     ["suspicious-token", 20, 10, 4, s[7], s[8]], // campagne « piège » pour la détection de fraude
   ];
-  for (const [cid, goal, days, ms, creator, benef] of demos) {
-    await (await core.connect(creator).createCampaign(eth(goal), days * DAY, benef.address, "file:" + cid, ms)).wait();
+  // Si `npm run pin` a été exécuté (clé Pinata), frontend/metadata/cids.json contient les VRAIS CID IPFS : on les utilise.
+  const cidFile = path.join(__dirname, "../frontend/metadata/cids.json");
+  const real = fs.existsSync(cidFile) ? JSON.parse(fs.readFileSync(cidFile)) : {};
+  for (const [name, goal, days, ms, creator, benef] of demos) {
+    const cid = real[name + ".json"] ? "ipfs://" + real[name + ".json"] : "file:" + name;
+    await (await core.connect(creator).createCampaign(eth(goal), days * DAY, benef.address, cid, ms)).wait();
   }
 
   // 2) Contributions « organiques » (montants variés, dispersés)
