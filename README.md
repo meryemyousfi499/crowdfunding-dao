@@ -7,7 +7,7 @@ contracts/   CFDToken (M1) · CrowdfundingCore (M2) · CrowdfundDAO (M3) · Mult
 test/        55 tests : unitaires, réentrance, snapshot, vote linéaire anti-Sybil, quorum « pour », veto du multisig, timelock, gel, multisig (seuil), keeper, fuzzing (fast-check)
 scripts/     deploy.js · seed.js (données de démo) · advance-time.js
 frontend/    dApp M4 (HTML/JS + Ethers.js, sans build; notifications.js = cloche 🔔 de notifications) · metadata/ (métadonnées de démo)
-scripts/     backend.js (deploy + keeper + surveillance IA) · demo-fraud.js (attaque de test en direct)
+scripts/     backend.js · fund.js · dev.js · make-owners.js · pin-metadata.js (deploy + keeper + surveillance IA) · demo-fraud.js (attaque de test en direct)
 analysis/    fraud_detector.py + ml_model.py (bonus IA hors-chaîne : web3.py + Pandas + Random Forest scikit-learn)
 docs/        ARCHITECTURE.md · SECURITE.md · AUDIT.md · GUIDE_METAMASK_OPENZEPPELIN.md · slither-report.json
 ```
@@ -25,7 +25,7 @@ pip install -r analysis/requirements.txt        # pour le script Python (ajouter
 ## 3. Compiler et tester
 ```bash
 npx hardhat compile
-npx hardhat test                  # 29 tests doivent passer
+npx hardhat test                  # 55 tests doivent passer
 ```
 > Réseau sans accès à `binaries.soliditylang.org` ? Utilisez le compilateur npm : `USE_SOLCJS=1 npx hardhat test` (ou `npm run test:offline`).
 
@@ -73,7 +73,7 @@ Résultats et corrections : **docs/AUDIT.md**.
 | Taux CFD | 1 ETH = 1000 CFD, frappés à la contribution, **verrouillés** jusqu'à la livraison complète ; brûlés au remboursement |
 | Statuts | Active → Réussie / Échouée (à l'échéance) ; Annulée (campagne vide annulée ou gel DAO) |
 | Retrait | Par tranches (1–5), chacune validée par un vote DAO ; 2 % de frais → trésorerie multisig 2/3 |
-| Vote | Poids = CFD au snapshot (vote linéaire, 1 CFD = 1 voix) · quorum = 10 % de l’offre en votes « pour » (+ plancher) · majorité simple · timelock 48 h · veto du multisig |
+| Vote | Poids = CFD au snapshot (vote linéaire, 1 CFD = 1 voix) · quorum = 10 % de l’offre en votes « pour » (+ plancher) · majorité simple · vote 5 min · timelock 2 min (paramétrables, voir `docs/ARCHITECTURE.md` §7) · veto du multisig |
 | Pause | `PAUSER_ROLE` (multisig) suspend contributions, remboursements, retraits ; **limitée à 7 jours** : ensuite n'importe qui appelle `unpauseExpired()` |
 
 ⚠ Projet pédagogique, contrats **non audités par un tiers** : ne jamais utiliser de fonds réels.

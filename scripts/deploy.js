@@ -10,16 +10,17 @@ async function main() {
   const deployer = signers[0];
   const isLocal = ["hardhat", "localhost"].includes(network.name);
 
-  // Paramètres de gouvernance : courts en local (démo), réalistes sur testnet.
-  const votingPeriod = Number(process.env.VOTING_PERIOD || (isLocal ? 300 : 3 * 24 * 3600));
-  const timelockDelay = Number(process.env.TIMELOCK_DELAY || (isLocal ? 60 : 48 * 3600));
-  const threshold = ethers.parseEther(process.env.PROPOSAL_THRESHOLD_CFD || (isLocal ? "10" : "100"));
+  // Paramètres de gouvernance : IDENTIQUES sur tous les réseaux (démo) : vote 5 min, timelock 2 min, seuil 10 CFD,
+  // plancher de quorum 100 CFD, snapshot 2 blocs. Valeurs « production » recommandées : voir docs/ARCHITECTURE.md §7.
+  const votingPeriod = Number(process.env.VOTING_PERIOD || 300);
+  const timelockDelay = Number(process.env.TIMELOCK_DELAY || 120);
+  const threshold = ethers.parseEther(process.env.PROPOSAL_THRESHOLD_CFD || "10");
   // Quorum sur les votes POUR, en points de base de l'offre au snapshot (1000 = 10 %).
   const quorumBps = Number(process.env.QUORUM_BPS || 1000);
   // Plancher absolu du quorum (CFD) : évite qu'un attaquant atteigne 10 % quand l'offre est encore minuscule.
-  const minQuorum = ethers.parseEther(process.env.MIN_QUORUM_CFD || (isLocal ? "100" : "1000"));
-  // Maturité du snapshot (blocs) : 7200 blocs ≈ 24 h sur Ethereum ; 1 en local. Réduire pour une démo Sepolia.
-  const snapshotLookback = Number(process.env.SNAPSHOT_LOOKBACK || (isLocal ? 1 : 7200));
+  const minQuorum = ethers.parseEther(process.env.MIN_QUORUM_CFD || "100");
+  // Maturité du snapshot (blocs) : 2 par défaut ; 7200 blocs ≈ 24 h sur Ethereum pour un usage réel.
+  const snapshotLookback = Number(process.env.SNAPSHOT_LOOKBACK || 2);
 
   // Propriétaires du multisig : en local 3 comptes de test ; sinon MULTISIG_OWNERS="0x..,0x..,0x.." (2 sur 3).
   const owners = process.env.MULTISIG_OWNERS
@@ -68,7 +69,14 @@ async function main() {
   await (await core.grantRole(await core.GOVERNANCE_ROLE(), await dao.getAddress())).wait();
 
   // Droits d'administration : transférés au multisig puis retirés au déployeur (sinon un seul compte pourrait
-  // s'accorder MINTER/GOVERNANCE et contourner la DAO). PAUSER_ROLE reste au déployeur (réaction rapide).
+  // s'accorder MINTER/GOVERNANCE et contourner la DAO). Le PAUSER_ROLE suit le même chemin (KEEP_PAUSER=1 pour le garder au déployeur : réaction plus rapide, mais un seul compte peut alors suspendre la plateforme).
+  // (avant le transfert d'admin : accorder un rôle exige encore DEFAULT_ADMIN_ROLE)
+  if (process.env.KEEP_PAUSER !== "1") {
+    const PAUSER = await core.PAUSER_ROLE();
+    await (await core.grantRole(PAUSER, await treasury.getAddress())).wait();
+    await (await core.renounceRole(PAUSER, deployer.address)).wait();
+    console.log("PAUSER_ROLE transféré au multisig (pause = 2 signatures sur 3).");
+  }
   if (process.env.KEEP_ADMIN !== "1") {
     const ADMIN = await token.DEFAULT_ADMIN_ROLE();
     const ms = await treasury.getAddress();
@@ -101,6 +109,31 @@ async function main() {
   fs.writeFileSync(path.join(__dirname, "../frontend/contracts.json"), JSON.stringify(out, null, 2));
   console.log("Adresses:", out.addresses);
   console.log("Exporté -> frontend/contracts.json");
+
+  // Copie datée par réseau (versionnée dans Git) : frontend/contracts.json est écrasé par chaque déploiement local,
+  // alors que deployments/sepolia.json reste la trace du déploiement public.
+  const dep = path.join(__dirname, "../deployments");
+  fs.mkdirSync(dep, { recursive: true });
+  fs.writeFileSync(path.join(dep, `${network.name}.json`), JSON.stringify(out, null, 2));
+  if (!isLocal) {
+    const scan = out.chainId === 11155111 ? "https://sepolia.etherscan.io" : "";
+    const link = (a) => (scan ? `[${a}](${scan}/address/${a})` : a);
+    fs.writeFileSync(path.join(__dirname, "../docs/DEPLOIEMENT_SEPOLIA.md"), `# Déploiement ${network.name} (chainId ${out.chainId})
+Déployé au bloc ${out.deployedAtBlock} par \`${deployer.address}\`.
+
+| Contrat | Adresse |
+|---|---|
+| CFDToken (M1) | ${link(out.addresses.token)} |
+| CrowdfundingCore (M2) | ${link(out.addresses.core)} |
+| CrowdfundDAO (M3) | ${link(out.addresses.dao)} |
+| MultiSigTreasury | ${link(out.addresses.treasury)} |
+
+Paramètres : ${JSON.stringify(out.params)}
+
+Pour pointer la dApp sur ce déploiement : \`npm run use:sepolia\` (copie deployments/sepolia.json vers frontend/contracts.json).
+`);
+    console.log("Écrit -> deployments/" + network.name + ".json et docs/DEPLOIEMENT_SEPOLIA.md (à versionner dans Git)");
+  }
 }
 
 main().catch((e) => { console.error(e); process.exitCode = 1; });

@@ -64,3 +64,19 @@
 - **Évaluation honnête** (`analysis/reports/ml_metrics.json`) : validation croisée 5 plis (précision/rappel ≈ 0,99 sur la simulation, donc optimiste car le simulateur définit les classes) et test de généralisation « un type de fraude jamais vu » : rappel ≈ 0,90 (Sybil) et 0,93 (baleine) mais **0 %** pour le wash-funding non vu en entraînement. Le modèle ne détecte donc que ce qui ressemble à ce qu'il a appris.
 - **Garde-fou** : sous 5 contributions, pas de score ML (données insuffisantes) ; seules les heuristiques s'appliquent.
 - **Perspectives** : ré-entraîner avec les gels réellement votés par la DAO, ajouter les votes (`VoteCast`), Isolation Forest non supervisé, graphe d'adresses.
+
+## 7. Paramètres de gouvernance : une seule table
+Mêmes valeurs par défaut sur **tous** les réseaux (`scripts/deploy.js`), immuables après déploiement :
+
+| Paramètre | Défaut (démo) | Variable d'environnement | Valeur « usage réel » recommandée |
+|---|---|---|---|
+| Durée du vote | **5 min** (300 s) | `VOTING_PERIOD` | 3 à 7 jours |
+| Timelock avant exécution | **2 min** (120 s) | `TIMELOCK_DELAY` | 24 à 72 h (fenêtre du veto du multisig) |
+| Expiration après timelock | 7 jours | constante `GRACE_PERIOD` | idem |
+| Seuil pour proposer | 10 CFD | `PROPOSAL_THRESHOLD_CFD` | 100 CFD |
+| Quorum (votes « pour ») | 10 % de l'offre | `QUORUM_BPS` | idem |
+| Plancher de quorum | 100 CFD | `MIN_QUORUM_CFD` | 1000 CFD |
+| Maturité du snapshot | 2 blocs | `SNAPSHOT_LOOKBACK` | 7200 blocs (≈ 24 h) |
+| Pause maximale | 7 jours | constante `MAX_PAUSE` | idem |
+
+Pourquoi des durées courtes : elles permettent de montrer tout le cycle (vote, file, exécution, versement) en direct. Une fenêtre de timelock de 2 min laisse peu de temps humain pour un veto : en production on la porte à 24–72 h. Les tests automatiques utilisent les mêmes valeurs (`test/helpers.js`).

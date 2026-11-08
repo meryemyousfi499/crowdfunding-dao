@@ -2,8 +2,8 @@ const { ethers } = require("hardhat");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 const DAY = 24 * 3600;
-const VOTING_PERIOD = 3 * DAY;
-const TIMELOCK = 2 * DAY; // 48 h
+const VOTING_PERIOD = 300; // 5 min (défaut de deploy.js)
+const TIMELOCK = 120; // 2 min (défaut de deploy.js)
 const THRESHOLD = ethers.parseEther("10"); // 10 CFD pour proposer
 const MIN_QUORUM = 0n; // plancher absolu désactivé par défaut dans les tests (testé à part)
 const LOOKBACK = 1; // snapshot = bloc précédent (testé à part avec une valeur plus grande)

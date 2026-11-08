@@ -16,7 +16,7 @@ MULTISIG_OWNERS=0xAdresse1,0xAdresse2,0xAdresse3
 # Optionnel : vérifier le code sur Etherscan
 ETHERSCAN_API_KEY=VOTRE_CLE_ETHERSCAN
 ```
-Paramètres par défaut hors local : vote 3 jours, timelock 48 h, seuil de proposition 100 CFD, quorum 10 % de l'offre (votes « pour »), veto du multisig, multisig 2 sur 3, seuil d'1 signature jusqu'à 0,1 ETH. Pour une démo plus rapide : `VOTING_PERIOD=600`, `TIMELOCK_DELAY=120`, `PROPOSAL_THRESHOLD_CFD=10`, `QUORUM_BPS=1000` dans le `.env`.
+Paramètres par défaut (identiques en local et sur Sepolia) : vote 5 min, timelock 2 min, seuil de proposition 10 CFD, plancher de quorum 100 CFD, quorum 10 % de l'offre (votes « pour »), veto du multisig, multisig 2 sur 3, seuil d'1 signature jusqu'à 0,1 ETH. **Ne mettez rien dans `.env` pour ces paramètres** : toute valeur écrite là remplace le défaut (voir `.env.example`).
 
 ## 2bis. Les 3 propriétaires du multisig (obligatoire hors local)
 Le déploiement exige 3 adresses **distinctes** (2 signatures sur 3). Le plus simple :
@@ -65,5 +65,5 @@ Laisse tourner dans un terminal : il met en file puis exécute les propositions 
 |---|---|
 | `insufficient funds` | Pas assez de SepoliaETH sur le compte du `.env`. |
 | `network sepolia not found` | `SEPOLIA_RPC_URL` ou `PRIVATE_KEY` manquant dans `.env`. |
-| Timelock/vote trop longs pour une démo | Réduisez `VOTING_PERIOD` / `TIMELOCK_DELAY` **avant** le déploiement (immuables). Sur un vrai réseau on ne peut pas avancer le temps. |
+| Vote ou timelock trop longs (ex. « fin du vote dans 2 j 23 h ») | Votre `.env` contient `VOTING_PERIOD` / `TIMELOCK_DELAY` : supprimez ces lignes puis **redéployez** (valeurs immuables). Sur un vrai réseau on ne peut pas avancer le temps. |
 | Métadonnées introuvables | Utilisez Pinata (Paramètres IPFS → *Tester la connexion*), sinon le titre n'est visible que dans votre navigateur. |
